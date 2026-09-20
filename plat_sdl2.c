@@ -11,6 +11,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <SDL.h>
 
@@ -40,10 +41,12 @@ static void update_output_size(void)
  * The absolute position in_sdl2 reads for a lightgun is still kept by SDL from the relative motion. */
 static void plat_sdl2_show_cursor(int show)
 {
-  SDL_ShowCursor(show ? SDL_ENABLE : SDL_DISABLE);
-  SDL_SetRelativeMouseMode(show ? SDL_FALSE : SDL_TRUE);
+  int r1 = SDL_ShowCursor(show ? SDL_ENABLE : SDL_DISABLE);
+  int r2 = SDL_SetRelativeMouseMode(show ? SDL_FALSE : SDL_TRUE);
   if (plat_sdl2_window != NULL)
     SDL_SetWindowGrab(plat_sdl2_window, show ? SDL_FALSE : SDL_TRUE);
+  fprintf(stderr, "plat_sdl2: cursor %s (ShowCursor %d, relative %d: %s)\n", show ? "shown" : "hidden",
+    r1, r2, r2 == 0 ? "ok" : SDL_GetError());
 }
 
 int plat_sdl2_init(const char *title, int w, int h, int fullscreen_, int vsync)
@@ -159,6 +162,45 @@ void plat_sdl2_clear(void)
   SDL_RenderPresent(plat_sdl2_renderer);
 }
 
+/* PLAT_SDL2_SHOT=<file.bmp> in the environment: what the renderer is about to present, saved every 5 s -
+ * for looking at a display one cannot see (a Pi over ssh); the emulator's own screenshot is the PSX frame
+ * before scaling and effects */
+static void plat_sdl2_debug_shot(void)
+{
+  static const char *path;
+  static int checked;
+  static Uint32 last;
+  static int count;
+  Uint32 now;
+  SDL_Surface *s;
+  int w, h;
+
+  if (!checked) {
+    path = getenv("PLAT_SDL2_SHOT");
+    checked = 1;
+  }
+  if (path == NULL)
+    return;
+  now = SDL_GetTicks();
+  if (last != 0 && now - last < 5000)
+    return;
+  last = now;
+  if (SDL_GetRendererOutputSize(plat_sdl2_renderer, &w, &h) != 0)
+    return;
+  s = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ARGB8888);
+  if (s == NULL)
+    return;
+  if (SDL_RenderReadPixels(plat_sdl2_renderer, NULL, SDL_PIXELFORMAT_ARGB8888, s->pixels, s->pitch) == 0) {
+    // a %d in the name numbers the frames (PLAT_SDL2_SHOT=/tmp/shot%d.bmp), else the file is rewritten
+    char name[512];
+    snprintf(name, sizeof(name), path, count++);
+    SDL_SaveBMP(s, name);
+  }
+  else
+    fprintf(stderr, "plat_sdl2: RenderReadPixels: %s\n", SDL_GetError());
+  SDL_FreeSurface(s);
+}
+
 int plat_sdl2_present(const void *rgb565, int w, int h, int pitch, const SDL_Rect *dst, int linear)
 {
   linear = !!linear;
@@ -193,6 +235,7 @@ int plat_sdl2_present(const void *rgb565, int w, int h, int pitch, const SDL_Rec
   SDL_SetRenderDrawColor(plat_sdl2_renderer, 0, 0, 0, 255);
   SDL_RenderClear(plat_sdl2_renderer);
   SDL_RenderCopy(plat_sdl2_renderer, texture, NULL, dst);
+  plat_sdl2_debug_shot();
   SDL_RenderPresent(plat_sdl2_renderer);
   return 0;
 }
