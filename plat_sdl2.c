@@ -35,6 +35,17 @@ static void update_output_size(void)
     plat_sdl2_win_w = w, plat_sdl2_win_h = h;
 }
 
+/* SDL_ShowCursor(SDL_DISABLE) alone leaves the pointer on the screen with the KMSDRM backend (a Pi):
+ * relative mouse mode is what hides it there, and it keeps the pointer inside the window on a desktop.
+ * The absolute position in_sdl2 reads for a lightgun is still kept by SDL from the relative motion. */
+static void plat_sdl2_show_cursor(int show)
+{
+  SDL_ShowCursor(show ? SDL_ENABLE : SDL_DISABLE);
+  SDL_SetRelativeMouseMode(show ? SDL_FALSE : SDL_TRUE);
+  if (plat_sdl2_window != NULL)
+    SDL_SetWindowGrab(plat_sdl2_window, show ? SDL_FALSE : SDL_TRUE);
+}
+
 int plat_sdl2_init(const char *title, int w, int h, int fullscreen_, int vsync)
 {
   Uint32 wflags = SDL_WINDOW_ALLOW_HIGHDPI;
@@ -84,7 +95,7 @@ int plat_sdl2_init(const char *title, int w, int h, int fullscreen_, int vsync)
         plat_sdl2_win_w, plat_sdl2_win_h, fullscreen ? " fullscreen" : "");
   }
 
-  SDL_ShowCursor(fullscreen ? SDL_DISABLE : SDL_ENABLE);
+  plat_sdl2_show_cursor(!fullscreen);
   return 0;
 
 fail:
@@ -124,7 +135,7 @@ int plat_sdl2_set_fullscreen(int on)
   fullscreen = on;
   if (!on)
     SDL_SetWindowSize(plat_sdl2_window, windowed_w, windowed_h);
-  SDL_ShowCursor(on ? SDL_DISABLE : SDL_ENABLE);
+  plat_sdl2_show_cursor(!on);
   update_output_size();
   if (plat_sdl2_resize_cb != NULL)
     plat_sdl2_resize_cb(plat_sdl2_win_w, plat_sdl2_win_h);
@@ -162,6 +173,12 @@ int plat_sdl2_present(const void *rgb565, int w, int h, int pitch, const SDL_Rec
       fprintf(stderr, "plat_sdl2: SDL_CreateTexture %dx%d failed: %s\n", w, h, SDL_GetError());
       return -1;
     }
+#if SDL_VERSION_ATLEAST(2, 0, 12)
+    // the hint is honoured at creation by every renderer; this is the explicit way where it exists
+    SDL_SetTextureScaleMode(texture, linear ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+#endif
+    if (tex_linear != linear)
+      fprintf(stderr, "plat_sdl2: %s filter\n", linear ? "linear" : "nearest");
     tex_w = w;
     tex_h = h;
     tex_linear = linear;
