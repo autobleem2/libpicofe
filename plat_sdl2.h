@@ -30,7 +30,13 @@ void plat_sdl2_set_title(const char *title);
 
 /* Upload a w x h RGB565 frame (pitch in pixels) and present it into dst (NULL = the whole window,
  * letterboxing is the caller's - clear first). linear = bilinear scaling, else nearest. */
-int  plat_sdl2_present(const void *rgb565, int w, int h, int pitch, const SDL_Rect *dst, int linear);
+/* how the frame reaches the screen (PLAT_SDL2_FILTER_*): nearest, bilinear, or an integer prescale
+ * into a render target followed by bilinear ("sharp": crisp pixels, no shimmer). Scanlines are drawn
+ * into the prescaled target at whole rows, so they stay even at any output size. */
+#define PLAT_SDL2_FILTER_OFF    0
+#define PLAT_SDL2_FILTER_LINEAR 1
+#define PLAT_SDL2_FILTER_SHARP  2
+int  plat_sdl2_present(const void *rgb565, int w, int h, int pitch, const SDL_Rect *dst, int filter);
 /* scanlines drawn over the next presents, at output resolution: one dark band per row of the
  * emulated picture (rows = its line count, 0 = none), thickness 1..3 (quarters of a row, at least a
  * pixel), alpha 0..255 how dark - even at any scale, filter or internal resolution */

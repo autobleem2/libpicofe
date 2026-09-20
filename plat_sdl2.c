@@ -25,6 +25,8 @@ void (*plat_sdl2_quit_cb)(void);
 
 static SDL_Texture *texture;
 static int tex_w, tex_h, tex_linear = -1;
+static SDL_Texture *target;     /* the integer-prescaled frame (sharp filter, or scanlines) */
+static int target_w, target_h;
 static int windowed_w, windowed_h;
 static int scan_rows, scan_thickness, scan_alpha;
 static int fullscreen;
@@ -60,6 +62,22 @@ int plat_sdl2_init(const char *title, int w, int h, int fullscreen_, int vsync)
   if (ret != 0) {
     fprintf(stderr, "plat_sdl2: SDL_Init failed: %s\n", SDL_GetError());
     return -1;
+  }
+  // a display that is not free yet (the launcher's window, or the previous emulator, still holds the DRM
+  // master for a few seconds after it is gone) makes SDL fall back to a driver that shows nothing: wait
+  // for the real one instead, unless that driver was asked for
+  {
+    const char *drv = SDL_GetCurrentVideoDriver(), *want = getenv("SDL_VIDEODRIVER");
+    int tries = 0;
+    while (drv != NULL && (strcmp(drv, "offscreen") == 0 || strcmp(drv, "dummy") == 0) &&
+           (want == NULL || strcmp(want, drv) != 0) && tries++ < 12) {
+      fprintf(stderr, "plat_sdl2: got the %s video driver - the display is not free yet, retrying\n", drv);
+      SDL_QuitSubSystem(SDL_INIT_VIDEO);
+      SDL_Delay(500);
+      if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0)
+        break;
+      drv = SDL_GetCurrentVideoDriver();
+    }
   }
 
   windowed_w = w;
@@ -98,6 +116,22 @@ int plat_sdl2_init(const char *title, int w, int h, int fullscreen_, int vsync)
         (info.flags & SDL_RENDERER_PRESENTVSYNC) ? " (vsync)" : "",
         plat_sdl2_win_w, plat_sdl2_win_h, fullscreen ? " fullscreen" : "");
   }
+  {
+    // the display's current mode against the largest it offers (is the output at the panel's native size?)
+    SDL_DisplayMode cur, best;
+    int di = SDL_GetWindowDisplayIndex(plat_sdl2_window), n, i;
+    if (di >= 0 && SDL_GetCurrentDisplayMode(di, &cur) == 0) {
+      best = cur;
+      n = SDL_GetNumDisplayModes(di);
+      for (i = 0; i < n; i++) {
+        SDL_DisplayMode m;
+        if (SDL_GetDisplayMode(di, i, &m) == 0 && m.w * m.h > best.w * best.h)
+          best = m;
+      }
+      printf("plat_sdl2: display mode %dx%d@%d, largest offered %dx%d@%d\n",
+        cur.w, cur.h, cur.refresh_rate, best.w, best.h, best.refresh_rate);
+    }
+  }
 
   plat_sdl2_show_cursor(!fullscreen);
   return 0;
@@ -112,6 +146,10 @@ void plat_sdl2_finish(void)
   if (texture != NULL) {
     SDL_DestroyTexture(texture);
     texture = NULL;
+  }
+  if (target != NULL) {
+    SDL_DestroyTexture(target);
+    target = NULL;
   }
   if (plat_sdl2_renderer != NULL) {
     SDL_DestroyRenderer(plat_sdl2_renderer);
@@ -235,9 +273,47 @@ static void draw_scanlines(const SDL_Rect *dst)
   SDL_SetRenderDrawBlendMode(plat_sdl2_renderer, SDL_BLENDMODE_NONE);
 }
 
-int plat_sdl2_present(const void *rgb565, int w, int h, int pitch, const SDL_Rect *dst, int linear)
+/* the render target the frame is prescaled into by a whole factor, (re)made to k*w x k*h; NULL if the
+ * renderer cannot (then the frame goes to the screen directly) */
+static SDL_Texture *prescale_target(int w, int h, int kx, int ky)
 {
-  linear = !!linear;
+  if (target != NULL && target_w == kx * w && target_h == ky * h)
+    return target;
+  if (target != NULL)
+    SDL_DestroyTexture(target);
+  SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
+  target = SDL_CreateTexture(plat_sdl2_renderer, SDL_PIXELFORMAT_RGB565, SDL_TEXTUREACCESS_TARGET, kx * w, ky * h);
+  if (target == NULL) {
+    fprintf(stderr, "plat_sdl2: no %dx%d render target: %s\n", kx * w, ky * h, SDL_GetError());
+    return NULL;
+  }
+#if SDL_VERSION_ATLEAST(2, 0, 12)
+  SDL_SetTextureScaleMode(target, SDL_ScaleModeLinear);
+#endif
+  target_w = kx * w;
+  target_h = ky * h;
+  fprintf(stderr, "plat_sdl2: prescale %dx%d -> %dx%d (%dx, %dx)\n", w, h, target_w, target_h, kx, ky);
+  return target;
+}
+
+int plat_sdl2_present(const void *rgb565, int w, int h, int pitch, const SDL_Rect *dst, int filter)
+{
+  int linear = filter == PLAT_SDL2_FILTER_LINEAR;
+  SDL_Texture *tg = NULL;
+
+  if (dst != NULL && (filter == PLAT_SDL2_FILTER_SHARP || (scan_rows > 0 && scan_alpha > 0))) {
+    // per axis, the whole factor that still fits the destination (a 512x240 frame in a 4:3 layer is
+    // 1.9x wide and 3x tall: 1x and 3x); with only scanlines to draw and no room, 1x keeps them at the
+    // source's rows
+    int kx = dst->w / w, ky = dst->h / h;
+    if (kx < 1) kx = 1;
+    if (ky < 1) ky = 1;
+    if (kx > 8) kx = 8;
+    if (ky > 8) ky = 8;
+    tg = prescale_target(w, h, kx, ky);
+  }
+  if (tg != NULL)
+    linear = 0;   // nearest into the target; the target's own mode does the final pass
   if (texture == NULL || tex_w != w || tex_h != h || tex_linear != linear) {
     if (texture != NULL)
       SDL_DestroyTexture(texture);
@@ -264,12 +340,25 @@ int plat_sdl2_present(const void *rgb565, int w, int h, int pitch, const SDL_Rec
     fprintf(stderr, "plat_sdl2: SDL_UpdateTexture failed: %s\n", SDL_GetError());
     return -1;
   }
+  if (tg != NULL) {
+    // pass 1: the frame into the target by the whole factor, the scanlines at its whole rows
+    SDL_Rect full = { 0, 0, target_w, target_h };
+    SDL_SetRenderTarget(plat_sdl2_renderer, tg);
+    SDL_RenderCopy(plat_sdl2_renderer, texture, NULL, &full);
+    if (scan_rows > 0 && scan_alpha > 0)
+      draw_scanlines(&full);
+    SDL_SetRenderTarget(plat_sdl2_renderer, NULL);
+#if SDL_VERSION_ATLEAST(2, 0, 12)
+    // pass 2's filter: bilinear for linear/sharp, nearest for "off" (the user asked for no smoothing)
+    SDL_SetTextureScaleMode(tg, filter == PLAT_SDL2_FILTER_OFF ? SDL_ScaleModeNearest : SDL_ScaleModeLinear);
+#endif
+  }
   // a frame that does not cover the window would leave the last one's edges otherwise, and the
   // backbuffer is not kept across presents on every driver: clear on every present
   SDL_SetRenderDrawColor(plat_sdl2_renderer, 0, 0, 0, 255);
   SDL_RenderClear(plat_sdl2_renderer);
-  SDL_RenderCopy(plat_sdl2_renderer, texture, NULL, dst);
-  if (dst != NULL && scan_rows > 0 && scan_alpha > 0)
+  SDL_RenderCopy(plat_sdl2_renderer, tg != NULL ? tg : texture, NULL, dst);
+  if (tg == NULL && dst != NULL && scan_rows > 0 && scan_alpha > 0)
     draw_scanlines(dst);
   plat_sdl2_debug_shot();
   SDL_RenderPresent(plat_sdl2_renderer);
