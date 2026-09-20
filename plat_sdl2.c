@@ -201,14 +201,15 @@ void plat_sdl2_clear(void)
   SDL_RenderPresent(plat_sdl2_renderer);
 }
 
-/* PLAT_SDL2_SHOT=<file.bmp> in the environment: what the renderer is about to present, saved every 5 s -
+/* PLAT_SDL2_SHOT=<file.bmp> in the environment: what the renderer is about to present, saved every 5 s
+ * (PLAT_SDL2_SHOT_MS) -
  * for looking at a display one cannot see (a Pi over ssh); the emulator's own screenshot is the PSX frame
  * before scaling and effects */
 static void plat_sdl2_debug_shot(void)
 {
   static const char *path;
   static int checked;
-  static Uint32 last;
+  static Uint32 last, interval = 5000;
   static int count;
   Uint32 now;
   SDL_Surface *s;
@@ -216,12 +217,15 @@ static void plat_sdl2_debug_shot(void)
 
   if (!checked) {
     path = getenv("PLAT_SDL2_SHOT");
+    // PLAT_SDL2_SHOT_MS: how often, for catching a menu screen (the default is easy on a Pi's tmpfs)
+    if (getenv("PLAT_SDL2_SHOT_MS") != NULL && atoi(getenv("PLAT_SDL2_SHOT_MS")) > 0)
+      interval = atoi(getenv("PLAT_SDL2_SHOT_MS"));
     checked = 1;
   }
   if (path == NULL)
     return;
   now = SDL_GetTicks();
-  if (last != 0 && now - last < 5000)
+  if (last != 0 && now - last < interval)
     return;
   last = now;
   if (SDL_GetRendererOutputSize(plat_sdl2_renderer, &w, &h) != 0)
