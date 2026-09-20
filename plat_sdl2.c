@@ -26,6 +26,7 @@ void (*plat_sdl2_quit_cb)(void);
 static SDL_Texture *texture;
 static int tex_w, tex_h, tex_linear = -1;
 static int windowed_w, windowed_h;
+static int scan_rows, scan_thickness, scan_alpha;
 static int fullscreen;
 
 static void update_output_size(void)
@@ -201,6 +202,39 @@ static void plat_sdl2_debug_shot(void)
   SDL_FreeSurface(s);
 }
 
+void plat_sdl2_set_scanlines(int rows, int thickness, int alpha)
+{
+  scan_rows = rows;
+  scan_thickness = thickness < 1 ? 1 : thickness > 3 ? 3 : thickness;
+  scan_alpha = alpha < 0 ? 0 : alpha > 255 ? 255 : alpha;
+}
+
+/* a translucent black band at the bottom of every emulated row, where that row lands on the screen */
+static void draw_scanlines(const SDL_Rect *dst)
+{
+  float row = (float)dst->h / scan_rows;
+  float band = row * scan_thickness / 4.0f;
+  SDL_Rect r;
+  int i;
+
+  if (band < 1.0f)
+    band = 1.0f;
+  if (band > row - 1.0f && row > 2.0f)
+    band = row - 1.0f;
+  SDL_SetRenderDrawBlendMode(plat_sdl2_renderer, SDL_BLENDMODE_BLEND);
+  SDL_SetRenderDrawColor(plat_sdl2_renderer, 0, 0, 0, (Uint8)scan_alpha);
+  r.x = dst->x;
+  r.w = dst->w;
+  r.h = (int)(band + 0.5f);
+  if (r.h < 1)
+    r.h = 1;
+  for (i = 1; i <= scan_rows; i++) {
+    r.y = dst->y + (int)(i * row - band + 0.5f);
+    SDL_RenderFillRect(plat_sdl2_renderer, &r);
+  }
+  SDL_SetRenderDrawBlendMode(plat_sdl2_renderer, SDL_BLENDMODE_NONE);
+}
+
 int plat_sdl2_present(const void *rgb565, int w, int h, int pitch, const SDL_Rect *dst, int linear)
 {
   linear = !!linear;
@@ -235,6 +269,8 @@ int plat_sdl2_present(const void *rgb565, int w, int h, int pitch, const SDL_Rec
   SDL_SetRenderDrawColor(plat_sdl2_renderer, 0, 0, 0, 255);
   SDL_RenderClear(plat_sdl2_renderer);
   SDL_RenderCopy(plat_sdl2_renderer, texture, NULL, dst);
+  if (dst != NULL && scan_rows > 0 && scan_alpha > 0)
+    draw_scanlines(dst);
   plat_sdl2_debug_shot();
   SDL_RenderPresent(plat_sdl2_renderer);
   return 0;

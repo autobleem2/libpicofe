@@ -31,6 +31,10 @@ void plat_sdl2_set_title(const char *title);
 /* Upload a w x h RGB565 frame (pitch in pixels) and present it into dst (NULL = the whole window,
  * letterboxing is the caller's - clear first). linear = bilinear scaling, else nearest. */
 int  plat_sdl2_present(const void *rgb565, int w, int h, int pitch, const SDL_Rect *dst, int linear);
+/* scanlines drawn over the next presents, at output resolution: one dark band per row of the
+ * emulated picture (rows = its line count, 0 = none), thickness 1..3 (quarters of a row, at least a
+ * pixel), alpha 0..255 how dark - even at any scale, filter or internal resolution */
+void plat_sdl2_set_scanlines(int rows, int thickness, int alpha);
 /* present a black frame */
 void plat_sdl2_clear(void);
 /* the caller's event loop hands every event it does not consume to this */
