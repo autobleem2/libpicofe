@@ -26,7 +26,7 @@ void (*plat_sdl2_quit_cb)(void);
 static SDL_Texture *texture;
 static int tex_w, tex_h, tex_linear = -1;
 static SDL_Texture *target;     /* the integer-prescaled frame (sharp filter, or scanlines) */
-static int target_w, target_h;
+static int target_w, target_h, target_linear = -1;
 static int windowed_w, windowed_h;
 static int scan_rows, scan_thickness, scan_alpha;
 static int fullscreen;
@@ -277,25 +277,28 @@ static void draw_scanlines(const SDL_Rect *dst)
   SDL_SetRenderDrawBlendMode(plat_sdl2_renderer, SDL_BLENDMODE_NONE);
 }
 
-/* the render target the frame is prescaled into by a whole factor, (re)made to k*w x k*h; NULL if the
- * renderer cannot (then the frame goes to the screen directly) */
-static SDL_Texture *prescale_target(int w, int h, int kx, int ky)
+/* the render target the frame is prescaled into by a whole factor, (re)made to k*w x k*h and to the
+ * filter its final pass to the screen uses (linear, or nearest with the filter off); NULL if the
+ * renderer cannot (then the frame goes to the screen directly).
+ * A texture's scale mode is only ever set through the hint at its creation, never with
+ * SDL_SetTextureScaleMode(): in SDL 2.0.12 (the PlayStation Classic's) that call runs the renderer's
+ * hook on a texture whose format the renderer does not have natively - RGB565 on the GLES2 renderer -
+ * and dereferences its missing driver data; 2.0.14 fixed it. The hint reaches the native texture too. */
+static SDL_Texture *prescale_target(int w, int h, int kx, int ky, int linear)
 {
-  if (target != NULL && target_w == kx * w && target_h == ky * h)
+  if (target != NULL && target_w == kx * w && target_h == ky * h && target_linear == linear)
     return target;
   if (target != NULL)
     SDL_DestroyTexture(target);
-  SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
+  SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, linear ? "linear" : "nearest");
   target = SDL_CreateTexture(plat_sdl2_renderer, SDL_PIXELFORMAT_RGB565, SDL_TEXTUREACCESS_TARGET, kx * w, ky * h);
   if (target == NULL) {
     fprintf(stderr, "plat_sdl2: no %dx%d render target: %s\n", kx * w, ky * h, SDL_GetError());
     return NULL;
   }
-#if SDL_VERSION_ATLEAST(2, 0, 12)
-  SDL_SetTextureScaleMode(target, SDL_ScaleModeLinear);
-#endif
   target_w = kx * w;
   target_h = ky * h;
+  target_linear = linear;
   fprintf(stderr, "plat_sdl2: prescale %dx%d -> %dx%d (%dx, %dx)\n", w, h, target_w, target_h, kx, ky);
   return target;
 }
@@ -314,14 +317,15 @@ int plat_sdl2_present(const void *rgb565, int w, int h, int pitch, const SDL_Rec
     if (ky < 1) ky = 1;
     if (kx > 8) kx = 8;
     if (ky > 8) ky = 8;
-    tg = prescale_target(w, h, kx, ky);
+    // pass 2's filter: bilinear for linear/sharp, nearest for "off" (the user asked for no smoothing)
+    tg = prescale_target(w, h, kx, ky, filter != PLAT_SDL2_FILTER_OFF);
   }
   if (tg != NULL)
     linear = 0;   // nearest into the target; the target's own mode does the final pass
   if (texture == NULL || tex_w != w || tex_h != h || tex_linear != linear) {
     if (texture != NULL)
       SDL_DestroyTexture(texture);
-    // the scale quality is read when the texture is made (SDL_SetTextureScaleMode is 2.0.12+)
+    // the scale quality is read when the texture is made (and only then - see prescale_target())
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, linear ? "linear" : "nearest");
     texture = SDL_CreateTexture(plat_sdl2_renderer, SDL_PIXELFORMAT_RGB565,
       SDL_TEXTUREACCESS_STREAMING, w, h);
@@ -329,10 +333,6 @@ int plat_sdl2_present(const void *rgb565, int w, int h, int pitch, const SDL_Rec
       fprintf(stderr, "plat_sdl2: SDL_CreateTexture %dx%d failed: %s\n", w, h, SDL_GetError());
       return -1;
     }
-#if SDL_VERSION_ATLEAST(2, 0, 12)
-    // the hint is honoured at creation by every renderer; this is the explicit way where it exists
-    SDL_SetTextureScaleMode(texture, linear ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
-#endif
     if (tex_linear != linear)
       fprintf(stderr, "plat_sdl2: %s filter\n", linear ? "linear" : "nearest");
     tex_w = w;
@@ -352,10 +352,6 @@ int plat_sdl2_present(const void *rgb565, int w, int h, int pitch, const SDL_Rec
     if (scan_rows > 0 && scan_alpha > 0)
       draw_scanlines(&full);
     SDL_SetRenderTarget(plat_sdl2_renderer, NULL);
-#if SDL_VERSION_ATLEAST(2, 0, 12)
-    // pass 2's filter: bilinear for linear/sharp, nearest for "off" (the user asked for no smoothing)
-    SDL_SetTextureScaleMode(tg, filter == PLAT_SDL2_FILTER_OFF ? SDL_ScaleModeNearest : SDL_ScaleModeLinear);
-#endif
   }
   // a frame that does not cover the window would leave the last one's edges otherwise, and the
   // backbuffer is not kept across presents on every driver: clear on every present
