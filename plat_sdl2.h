@@ -28,19 +28,21 @@ int  plat_sdl2_set_fullscreen(int on);
 int  plat_sdl2_is_fullscreen(void);
 void plat_sdl2_set_title(const char *title);
 
-/* Upload a w x h RGB565 frame (pitch in pixels) and present it into dst (NULL = the whole window,
- * letterboxing is the caller's - clear first). linear = bilinear scaling, else nearest. */
-/* how the frame reaches the screen (PLAT_SDL2_FILTER_*): nearest, bilinear, or an integer prescale
- * into a render target followed by bilinear ("sharp": crisp pixels, no shimmer). Scanlines are drawn
- * into the prescaled target at whole rows, so they stay even at any output size. */
+/* Upload a w x h RGB565 frame (pitch in pixels) and present it into dst (NULL = the whole window;
+ * the window is cleared first, what is outside dst is black). The frame is scaled to dst by the
+ * renderer in one pass with the filter (PLAT_SDL2_FILTER_*: nearest, bilinear, or "sharp" = nearest
+ * to a whole multiple in a render target, then bilinear for the remainder - crisp pixels, no shimmer),
+ * and the scanlines are drawn over the scaled picture at the screen rows each emulated row occupies -
+ * nothing is scaled after them, so they are exact at any output size. */
 #define PLAT_SDL2_FILTER_OFF    0
 #define PLAT_SDL2_FILTER_LINEAR 1
 #define PLAT_SDL2_FILTER_SHARP  2
 int  plat_sdl2_present(const void *rgb565, int w, int h, int pitch, const SDL_Rect *dst, int filter);
-/* scanlines drawn over the next presents, at output resolution: one dark band per row of the
- * emulated picture (rows = its line count, 0 = none), thickness 1..3 (quarters of a row, at least a
- * pixel), alpha 0..255 how dark - even at any scale, filter or internal resolution */
-void plat_sdl2_set_scanlines(int rows, int thickness, int alpha);
+/* scanlines drawn over the next presents, at output resolution: 240 lines over the picture's height,
+ * a property of the screen like a CRT's (the same whatever the game's mode, filter or internal
+ * resolution), each a dark band at its bottom; on = 0 for none, thickness 1..3 (quarters of a line, at
+ * least a pixel), alpha 0..255 how dark */
+void plat_sdl2_set_scanlines(int on, int thickness, int alpha);
 /* present a black frame */
 void plat_sdl2_clear(void);
 /* the caller's event loop hands every event it does not consume to this */

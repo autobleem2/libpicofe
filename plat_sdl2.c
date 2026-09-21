@@ -25,10 +25,12 @@ void (*plat_sdl2_quit_cb)(void);
 
 static SDL_Texture *texture;
 static int tex_w, tex_h, tex_linear = -1;
-static SDL_Texture *target;     /* the integer-prescaled frame (sharp filter, or scanlines) */
-static int target_w, target_h, target_linear = -1;
+static SDL_Texture *target;     /* the integer-prescaled frame (sharp filter) */
+static int target_w, target_h;
 static int windowed_w, windowed_h;
-static int scan_rows, scan_thickness, scan_alpha;
+static int scan_on, scan_thickness, scan_alpha;
+static SDL_Texture *scan_tex;   /* the bands as one ARGB overlay the size of dst, blended over the frame */
+static int scan_tex_w, scan_tex_h, scan_tex_band, scan_tex_alpha;
 static int fullscreen;
 
 static void update_output_size(void)
@@ -151,6 +153,10 @@ void plat_sdl2_finish(void)
     SDL_DestroyTexture(target);
     target = NULL;
   }
+  if (scan_tex != NULL) {
+    SDL_DestroyTexture(scan_tex);
+    scan_tex = NULL;
+  }
   if (plat_sdl2_renderer != NULL) {
     SDL_DestroyRenderer(plat_sdl2_renderer);
     plat_sdl2_renderer = NULL;
@@ -244,84 +250,126 @@ static void plat_sdl2_debug_shot(void)
   SDL_FreeSurface(s);
 }
 
-void plat_sdl2_set_scanlines(int rows, int thickness, int alpha)
+void plat_sdl2_set_scanlines(int on, int thickness, int alpha)
 {
-  scan_rows = rows;
+  scan_on = on;
   scan_thickness = thickness < 1 ? 1 : thickness > 3 ? 3 : thickness;
   scan_alpha = alpha < 0 ? 0 : alpha > 255 ? 255 : alpha;
 }
 
-/* a translucent black band at the bottom of every emulated row, where that row lands on the screen */
+/* The scanlines are a property of the screen, as a CRT's are: SCAN_LINES of them over the picture's
+ * height whatever the game's mode (a 480-line screen or a PAL frame shows through the same lines), each
+ * a translucent black band at the bottom of its line - at 720p 3 px lines with 1-2 px bands, at 1080p
+ * 4.5 px lines (spaced 4/5 alternately, as they must be) with 1-3 px bands. The band is thickness/4 of
+ * the line, 1 px at least, and the line keeps a pixel of picture. They are drawn over the frame after
+ * it has been scaled to the screen, and nothing is scaled after them - that second scale is what made
+ * them uneven before.
+ * The overlay is one ARGB texture the size of the picture, made on the CPU when the size, thickness or
+ * level changes and blended over the frame in a single copy - pcsx-ab's RGBA scanline image, rather than
+ * a fill rect per line (which SDL 2.0.12's GLES2 renderer on the console drew 1 px high whatever was
+ * asked). */
+#define SCAN_LINES 240
+
 static void draw_scanlines(const SDL_Rect *dst)
 {
-  float row = (float)dst->h / scan_rows;
-  float band = row * scan_thickness / 4.0f;
-  SDL_Rect r;
-  int i;
+  int rows = SCAN_LINES, band;
 
-  if (band < 1.0f)
-    band = 1.0f;
-  if (band > row - 1.0f && row > 2.0f)
-    band = row - 1.0f;
-  SDL_SetRenderDrawBlendMode(plat_sdl2_renderer, SDL_BLENDMODE_BLEND);
-  SDL_SetRenderDrawColor(plat_sdl2_renderer, 0, 0, 0, (Uint8)scan_alpha);
-  r.x = dst->x;
-  r.w = dst->w;
-  r.h = (int)(band + 0.5f);
-  if (r.h < 1)
-    r.h = 1;
-  for (i = 1; i <= scan_rows; i++) {
-    r.y = dst->y + (int)(i * row - band + 0.5f);
-    SDL_RenderFillRect(plat_sdl2_renderer, &r);
+  band = (dst->h * scan_thickness / 4 + rows / 2) / rows;   /* round(line * thickness / 4) */
+  if (band < 1)
+    band = 1;
+  if (dst->h >= rows * 2 && band > dst->h / rows - 1)
+    band = dst->h / rows - 1;
+  if (scan_tex == NULL || scan_tex_w != dst->w || scan_tex_h != dst->h ||
+      scan_tex_band != band || scan_tex_alpha != scan_alpha) {
+    Uint32 *px = calloc((size_t)dst->w * dst->h, 4);   /* transparent black */
+    Uint32 dark = (Uint32)scan_alpha << 24;             /* ARGB: black at the bands' alpha */
+    int i, y, x;
+
+    if (scan_tex != NULL) {
+      SDL_DestroyTexture(scan_tex);
+      scan_tex = NULL;
+    }
+    if (px == NULL)
+      return;
+    for (i = 1; i <= rows; i++) {
+      int y1 = dst->h * i / rows;   /* the row's last screen line, exactly */
+      for (y = y1 - band; y < y1; y++) {
+        Uint32 *row = px + (size_t)y * dst->w;
+        if (y < 0)
+          continue;
+        for (x = 0; x < dst->w; x++)
+          row[x] = dark;
+      }
+    }
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "nearest");
+    scan_tex = SDL_CreateTexture(plat_sdl2_renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC,
+      dst->w, dst->h);
+    if (scan_tex == NULL || SDL_UpdateTexture(scan_tex, NULL, px, dst->w * 4) != 0 ||
+        SDL_SetTextureBlendMode(scan_tex, SDL_BLENDMODE_BLEND) != 0) {
+      fprintf(stderr, "plat_sdl2: no %dx%d scanline overlay: %s\n", dst->w, dst->h, SDL_GetError());
+      if (scan_tex != NULL)
+        SDL_DestroyTexture(scan_tex);
+      scan_tex = NULL;
+      free(px);
+      return;
+    }
+    free(px);
+    scan_tex_w = dst->w;
+    scan_tex_h = dst->h;
+    scan_tex_band = band;
+    scan_tex_alpha = scan_alpha;
+    fprintf(stderr, "plat_sdl2: scanlines: %d lines over %d px, %d px bands, alpha %d\n", rows, dst->h, band, scan_alpha);
   }
-  SDL_SetRenderDrawBlendMode(plat_sdl2_renderer, SDL_BLENDMODE_NONE);
+  SDL_RenderCopy(plat_sdl2_renderer, scan_tex, NULL, dst);
 }
 
-/* the render target the frame is prescaled into by a whole factor, (re)made to k*w x k*h and to the
- * filter its final pass to the screen uses (linear, or nearest with the filter off); NULL if the
- * renderer cannot (then the frame goes to the screen directly).
- * A texture's scale mode is only ever set through the hint at its creation, never with
- * SDL_SetTextureScaleMode(): in SDL 2.0.12 (the PlayStation Classic's) that call runs the renderer's
- * hook on a texture whose format the renderer does not have natively - RGB565 on the GLES2 renderer -
- * and dereferences its missing driver data; 2.0.14 fixed it. The hint reaches the native texture too. */
-static SDL_Texture *prescale_target(int w, int h, int kx, int ky, int linear)
+/* The render target the sharp filter prescales the frame into by a whole factor, (re)made to k*w x k*h;
+ * NULL if the renderer cannot (then the frame goes to the screen directly, as with the linear filter).
+ * It is 8888, native to every renderer, so it is never a wrapper around a native texture - and a texture's
+ * scale mode is only ever set through the hint at its creation, never with SDL_SetTextureScaleMode(): in
+ * SDL 2.0.12 (the PlayStation Classic's) that call runs the renderer's hook on a wrapper texture
+ * (RGB565 on the GLES2 renderer, say), which has no driver data to dereference; 2.0.14 fixed it. */
+static SDL_Texture *prescale_target(int w, int h, int kx, int ky)
 {
-  if (target != NULL && target_w == kx * w && target_h == ky * h && target_linear == linear)
+  if (target != NULL && target_w == kx * w && target_h == ky * h)
     return target;
   if (target != NULL)
     SDL_DestroyTexture(target);
-  SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, linear ? "linear" : "nearest");
-  target = SDL_CreateTexture(plat_sdl2_renderer, SDL_PIXELFORMAT_RGB565, SDL_TEXTUREACCESS_TARGET, kx * w, ky * h);
+  SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
+  target = SDL_CreateTexture(plat_sdl2_renderer, SDL_PIXELFORMAT_RGB888, SDL_TEXTUREACCESS_TARGET, kx * w, ky * h);
   if (target == NULL) {
     fprintf(stderr, "plat_sdl2: no %dx%d render target: %s\n", kx * w, ky * h, SDL_GetError());
     return NULL;
   }
   target_w = kx * w;
   target_h = ky * h;
-  target_linear = linear;
   fprintf(stderr, "plat_sdl2: prescale %dx%d -> %dx%d (%dx, %dx)\n", w, h, target_w, target_h, kx, ky);
   return target;
 }
 
+/* The frame to the screen, in one scale: the RGB565 frame goes into a streaming texture whose scale mode
+ * is the filter (off = nearest, linear = bilinear), that texture is drawn into dst by the renderer, and
+ * the scanlines go over the result at screen rows (draw_scanlines). The backbuffer is the screen-sized
+ * buffer of pcsx-ab's chain; what is outside dst (the bands of a 4:3 picture) is free for anything drawn
+ * before the present. The sharp filter alone has a pass before that: nearest into a whole-multiple render
+ * target, which is then drawn into dst bilinearly, so the pixels' edges stay crisp and only the
+ * remainder of the scale is smoothed - at a screen that is an exact multiple (720p for a 240-line frame)
+ * it is the same picture as off. A 2x-enhanced frame is just a bigger texture on the same path. */
 int plat_sdl2_present(const void *rgb565, int w, int h, int pitch, const SDL_Rect *dst, int filter)
 {
   int linear = filter == PLAT_SDL2_FILTER_LINEAR;
   SDL_Texture *tg = NULL;
 
-  if (dst != NULL && (filter == PLAT_SDL2_FILTER_SHARP || (scan_rows > 0 && scan_alpha > 0))) {
+  if (dst != NULL && filter == PLAT_SDL2_FILTER_SHARP) {
     // per axis, the whole factor that still fits the destination (a 512x240 frame in a 4:3 layer is
-    // 1.9x wide and 3x tall: 1x and 3x); with only scanlines to draw and no room, 1x keeps them at the
-    // source's rows
+    // 1.9x wide and 3x tall: 1x and 3x)
     int kx = dst->w / w, ky = dst->h / h;
     if (kx < 1) kx = 1;
     if (ky < 1) ky = 1;
     if (kx > 8) kx = 8;
     if (ky > 8) ky = 8;
-    // pass 2's filter: bilinear for linear/sharp, nearest for "off" (the user asked for no smoothing)
-    tg = prescale_target(w, h, kx, ky, filter != PLAT_SDL2_FILTER_OFF);
+    tg = prescale_target(w, h, kx, ky);
   }
-  if (tg != NULL)
-    linear = 0;   // nearest into the target; the target's own mode does the final pass
   if (texture == NULL || tex_w != w || tex_h != h || tex_linear != linear) {
     if (texture != NULL)
       SDL_DestroyTexture(texture);
@@ -345,12 +393,10 @@ int plat_sdl2_present(const void *rgb565, int w, int h, int pitch, const SDL_Rec
     return -1;
   }
   if (tg != NULL) {
-    // pass 1: the frame into the target by the whole factor, the scanlines at its whole rows
+    // sharp: the frame into the target by the whole factor, nearest
     SDL_Rect full = { 0, 0, target_w, target_h };
     SDL_SetRenderTarget(plat_sdl2_renderer, tg);
     SDL_RenderCopy(plat_sdl2_renderer, texture, NULL, &full);
-    if (scan_rows > 0 && scan_alpha > 0)
-      draw_scanlines(&full);
     SDL_SetRenderTarget(plat_sdl2_renderer, NULL);
   }
   // a frame that does not cover the window would leave the last one's edges otherwise, and the
@@ -358,7 +404,7 @@ int plat_sdl2_present(const void *rgb565, int w, int h, int pitch, const SDL_Rec
   SDL_SetRenderDrawColor(plat_sdl2_renderer, 0, 0, 0, 255);
   SDL_RenderClear(plat_sdl2_renderer);
   SDL_RenderCopy(plat_sdl2_renderer, tg != NULL ? tg : texture, NULL, dst);
-  if (tg == NULL && dst != NULL && scan_rows > 0 && scan_alpha > 0)
+  if (dst != NULL && scan_on && scan_alpha > 0)
     draw_scanlines(dst);
   plat_sdl2_debug_shot();
   SDL_RenderPresent(plat_sdl2_renderer);
