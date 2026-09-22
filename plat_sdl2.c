@@ -32,6 +32,11 @@ static int scan_on, scan_thickness, scan_alpha;
 static SDL_Texture *scan_tex;   /* the bands as one ARGB overlay the size of dst, blended over the frame */
 static int scan_tex_w, scan_tex_h, scan_tex_band, scan_tex_alpha;
 static int fullscreen;
+static SDL_atomic_t frame_count;  /* presents so far; shot_want/shot_serial: a debug driver's readback */
+static SDL_atomic_t shot_want, shot_serial;
+static int frame_cache_on;
+static SDL_mutex *frame_cache_lock;
+static SDL_Surface *frame_cache;  /* the last frame read back, ARGB8888 */
 
 static void update_output_size(void)
 {
@@ -250,6 +255,69 @@ static void plat_sdl2_debug_shot(void)
   SDL_FreeSurface(s);
 }
 
+/* The frame a debug driver asks for (see the header): a readback costs a GPU sync, so it happens only
+ * when one was asked for, in the present that follows the request. The driver thread waits for the
+ * serial to move and then writes the surface out under the lock. */
+static void plat_sdl2_shot_take(void)
+{
+  int w, h;
+
+  if (!frame_cache_on || SDL_AtomicGet(&shot_want) == 0)
+    return;
+  if (SDL_GetRendererOutputSize(plat_sdl2_renderer, &w, &h) != 0)
+    return;
+  SDL_LockMutex(frame_cache_lock);
+  if (frame_cache != NULL && (frame_cache->w != w || frame_cache->h != h)) {
+    SDL_FreeSurface(frame_cache);
+    frame_cache = NULL;
+  }
+  if (frame_cache == NULL)
+    frame_cache = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ARGB8888);
+  if (frame_cache != NULL &&
+      SDL_RenderReadPixels(plat_sdl2_renderer, NULL, SDL_PIXELFORMAT_ARGB8888,
+        frame_cache->pixels, frame_cache->pitch) != 0)
+    fprintf(stderr, "plat_sdl2: RenderReadPixels: %s\n", SDL_GetError());
+  SDL_UnlockMutex(frame_cache_lock);
+  SDL_AtomicSet(&shot_want, 0);
+  SDL_AtomicAdd(&shot_serial, 1);
+}
+
+void plat_sdl2_frame_cache(int on)
+{
+  if (on && frame_cache_lock == NULL)
+    frame_cache_lock = SDL_CreateMutex();
+  frame_cache_on = on && frame_cache_lock != NULL;
+}
+
+unsigned int plat_sdl2_frame_count(void)
+{
+  return (unsigned int)SDL_AtomicGet(&frame_count);
+}
+
+unsigned int plat_sdl2_shot_request(void)
+{
+  SDL_AtomicSet(&shot_want, 1);
+  return (unsigned int)SDL_AtomicGet(&shot_serial);
+}
+
+unsigned int plat_sdl2_shot_serial(void)
+{
+  return (unsigned int)SDL_AtomicGet(&shot_serial);
+}
+
+int plat_sdl2_shot_save(const char *path)
+{
+  int ret = -1;
+
+  if (frame_cache_lock == NULL)
+    return -1;
+  SDL_LockMutex(frame_cache_lock);
+  if (frame_cache != NULL)
+    ret = SDL_SaveBMP(frame_cache, path);
+  SDL_UnlockMutex(frame_cache_lock);
+  return ret;
+}
+
 void plat_sdl2_set_scanlines(int on, int thickness, int alpha)
 {
   scan_on = on;
@@ -407,6 +475,8 @@ int plat_sdl2_present(const void *rgb565, int w, int h, int pitch, const SDL_Rec
   if (dst != NULL && scan_on && scan_alpha > 0)
     draw_scanlines(dst);
   plat_sdl2_debug_shot();
+  plat_sdl2_shot_take();
+  SDL_AtomicAdd(&frame_count, 1);
   SDL_RenderPresent(plat_sdl2_renderer);
   return 0;
 }

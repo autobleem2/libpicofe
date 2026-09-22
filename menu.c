@@ -50,6 +50,7 @@ void *g_menubg_src_ptr;
 int g_menuscreen_w;
 int g_menuscreen_h;
 int g_menuscreen_pp;
+const char *menu_sel_name = "";
 int g_menubg_src_w;
 int g_menubg_src_h;
 int g_menubg_src_pp;
@@ -580,6 +581,8 @@ static void me_draw(const menu_entry *entries, int sel, void (*draw_more)(void))
 	}
 	h = n * me_mfont_h;
 	w += me_mfont_w * 2; /* selector */
+
+	menu_sel_name = ent_sel->name;	/* the row the cursor is on, for a debug driver (see menu.h) */
 
 	if (w > g_menuscreen_w) {
 		lprintf("width %d > %d\n", w, g_menuscreen_w);

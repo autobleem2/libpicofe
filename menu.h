@@ -119,6 +119,9 @@ extern void *g_menubg_src_ptr;
 extern int g_menuscreen_w;
 extern int g_menuscreen_h;
 extern int g_menuscreen_pp; // pitch (in pixels)
+/* the name of the row the cursor is on, kept by every menu draw: what a debug driver needs to walk the
+ * menus by name instead of counting keypresses (the app's driver reads it, nothing here does) */
+extern const char *menu_sel_name;
 extern int g_menubg_src_w;
 extern int g_menubg_src_h;
 extern int g_menubg_src_pp;

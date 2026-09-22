@@ -45,6 +45,18 @@ int  plat_sdl2_present(const void *rgb565, int w, int h, int pitch, const SDL_Re
 void plat_sdl2_set_scanlines(int on, int thickness, int alpha);
 /* present a black frame */
 void plat_sdl2_clear(void);
+
+/* What a debug driver on a thread of its own needs of the renderer (the app's, ours is
+ * frontend/ab/ab_debug.c): how many frames were presented, and the last one as a file. A readback is a
+ * GPU sync, so one happens only where it is asked for: plat_sdl2_shot_request() returns the serial to
+ * wait past, the next present reads the frame back, plat_sdl2_shot_serial() moves, and
+ * plat_sdl2_shot_save() writes that frame as a BMP (0 = written). All four are safe from another thread;
+ * nothing is read back until plat_sdl2_frame_cache(1) turns the cache on. */
+void plat_sdl2_frame_cache(int on);
+unsigned int plat_sdl2_frame_count(void);
+unsigned int plat_sdl2_shot_request(void);
+unsigned int plat_sdl2_shot_serial(void);
+int  plat_sdl2_shot_save(const char *path);
 /* the caller's event loop hands every event it does not consume to this */
 void plat_sdl2_event_handler(void *event);
 
