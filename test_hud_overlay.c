@@ -2,9 +2,13 @@
  * A standalone smoke test for plat_sdl2's HUD overlay (EMU-15): a callback set with
  * plat_sdl2_set_hud_cb() must run after the frame and the scanlines, never before them - the bug this
  * guards against is a HUD element baked into the emulated frame, which the scanline overlay (or any
- * scaling) then dims or hides. Runs headless (SDL_VIDEODRIVER=dummy, a software renderer), no display
- * needed. Not part of a CMake build (libpicofe has none of its own) - the AutoBleem-side tests in
- * frontend/ab/test_*.c are the same kind of thing: compile and run directly.
+ * scaling) then dims or hides. The mechanism is the same whatever the callback draws - a battery icon
+ * (part 1) or a text notice such as hud_msg/FPS/CPU load (part 2, frontend/ab/ab_hud_text.c in the
+ * pcsx-abnxt repo, tested separately there since it needs that repo's own font data) - so this test proves
+ * it once, generically, with a plain fill standing in for "a HUD element" (case 3) and, since part 2, a
+ * thin bar standing in for "a notice" specifically (case 6). Runs headless (SDL_VIDEODRIVER=dummy, a
+ * software renderer), no display needed. Not part of a CMake build (libpicofe has none of its own) - the
+ * AutoBleem-side tests in frontend/ab/test_*.c are the same kind of thing: compile and run directly.
  *
  *   gcc -o test_hud_overlay plat_sdl2.c test_hud_overlay.c $(pkg-config --cflags --libs sdl2) && ./test_hud_overlay
  *
@@ -37,6 +41,27 @@ static void expect(int cond, const char *what)
 
 static int hud_calls;
 static SDL_Rect hud_last_dst;
+
+/* case 6/7's callback: a "notice" - a small element tucked into one corner of dst, the shape a text line
+ * like hud_msg/FPS/CPU load actually is (frontend/ab/ab_hud_text.c in the pcsx-abnxt repo draws real text
+ * the same way: a texture, copied to a small rect in a corner of dst, never SDL_RenderFillRect). */
+static void test_notice_cb(SDL_Renderer *renderer, const SDL_Rect *dst)
+{
+	Uint32 blue = 0xff0000ff; /* ARGB8888, opaque blue */
+	SDL_Texture *tex;
+	SDL_Rect r;
+
+	tex = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC, 1, 1);
+	if (tex == NULL)
+		return;
+	SDL_UpdateTexture(tex, NULL, &blue, 4);
+	r.x = dst->x;
+	r.y = dst->y + dst->h - 16;
+	r.w = 32;
+	r.h = 16;
+	SDL_RenderCopy(renderer, tex, NULL, &r);
+	SDL_DestroyTexture(tex);
+}
 
 /* the callback under test: fills the whole dst with a solid, distinctive color via a small texture
  * (never SDL_RenderFillRect - see the repo's CLAUDE.md: SDL's GLES2 on the console draws a fill rect
@@ -125,6 +150,35 @@ int main(int argc, char *argv[])
 	hud_calls = 0;
 	plat_sdl2_present(frame, 8, 8, 8, &dst, PLAT_SDL2_FILTER_OFF);
 	expect(hud_calls == 0, "HUD callback cleared: not called any more");
+
+	/* 6) EMU-15 part 2's own bug, reproduced the same way: a "notice" - a small element in one corner of
+	 * the frame, not the plain full-dst fill case 2/3 used - is exactly as vulnerable as the battery icon
+	 * was to being baked into the source frame before present(). Bake a notice into the bottom-left 4x2
+	 * texels of the 8x8 source frame (RGB565 blue); at the 8x scale this test's 64x64 dst gives an 8x8
+	 * source, that lands in dst's bottom-left 32x16 px block - exactly where a real hud_msg/FPS line would
+	 * sit (frontend/ab/ab_hud_text.c positions its text there too). */
+	plat_sdl2_set_scanlines(1, 3, 255);
+	for (i = 0; i < 8 * 8; i++)
+		frame[i] = 0xffff; /* white background */
+	{
+		int nx, ny;
+		for (ny = 6; ny < 8; ny++)
+			for (nx = 0; nx < 4; nx++)
+				frame[ny * 8 + nx] = 0x001f; /* RGB565 blue */
+	}
+	plat_sdl2_present(frame, 8, 8, 8, &dst, PLAT_SDL2_FILTER_OFF);
+	expect(read_pixel(16, 56) == 0x000000,
+		"heavy scanlines, notice baked into the frame: hidden under them (the bug)");
+
+	/* 7) the same notice, in the same corner, drawn through the HUD callback instead of baked into the
+	 * frame: it must come out on top of the scanlines, exactly where a real notice would - the fix. */
+	plat_sdl2_set_hud_cb(test_notice_cb);
+	for (i = 0; i < 8 * 8; i++)
+		frame[i] = 0xffff; /* plain white frame this time - nothing baked in */
+	plat_sdl2_present(frame, 8, 8, 8, &dst, PLAT_SDL2_FILTER_OFF);
+	expect(read_pixel(16, 56) == 0x0000ff,
+		"heavy scanlines, notice via HUD cb: visible, not dimmed or hidden");
+	plat_sdl2_set_hud_cb(NULL);
 
 	plat_sdl2_finish();
 
