@@ -46,6 +46,14 @@ void plat_sdl2_set_scanlines(int on, int thickness, int alpha);
 /* present a black frame */
 void plat_sdl2_clear(void);
 
+/* An overlay drawn every present() that has a dst rect, after the frame and the scanlines and before the
+ * debug shot/screenshot readback - at screen resolution, over dst, never scaled or dimmed by anything
+ * before it. For a HUD element (e.g. a battery icon) that must stay legible regardless of the emulated
+ * frame's own resolution or the scanline overlay, instead of being drawn into the frame itself. Set to
+ * NULL to remove it (the default). Not called for a present with dst == NULL (a full-window layer, e.g.
+ * the menu, is already its own layer with nothing drawn under it). */
+void plat_sdl2_set_hud_cb(void (*cb)(SDL_Renderer *renderer, const SDL_Rect *dst));
+
 /* What a debug driver on a thread of its own needs of the renderer (the app's, ours is
  * frontend/ab/ab_debug.c): how many frames were presented, and the last one as a file. A readback is a
  * GPU sync, so one happens only where it is asked for: plat_sdl2_shot_request() returns the serial to

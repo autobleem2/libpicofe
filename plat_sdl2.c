@@ -37,6 +37,12 @@ static SDL_atomic_t shot_want, shot_serial;
 static int frame_cache_on;
 static SDL_mutex *frame_cache_lock;
 static SDL_Surface *frame_cache;  /* the last frame read back, ARGB8888 */
+static void (*hud_cb)(SDL_Renderer *renderer, const SDL_Rect *dst);  /* EMU-15: see plat_sdl2_set_hud_cb() */
+
+void plat_sdl2_set_hud_cb(void (*cb)(SDL_Renderer *renderer, const SDL_Rect *dst))
+{
+  hud_cb = cb;
+}
 
 static void update_output_size(void)
 {
@@ -474,6 +480,11 @@ int plat_sdl2_present(const void *rgb565, int w, int h, int pitch, const SDL_Rec
   SDL_RenderCopy(plat_sdl2_renderer, tg != NULL ? tg : texture, NULL, dst);
   if (dst != NULL && scan_on && scan_alpha > 0)
     draw_scanlines(dst);
+  /* EMU-15: after the frame and the scanlines, before the debug shot/screenshot readback - so a HUD
+   * overlay (e.g. a battery icon) is never baked into the emulated frame and never dimmed by the
+   * scanlines, whatever the frame's own resolution or scale. */
+  if (dst != NULL && hud_cb != NULL)
+    hud_cb(plat_sdl2_renderer, dst);
   plat_sdl2_debug_shot();
   plat_sdl2_shot_take();
   SDL_AtomicAdd(&frame_count, 1);
