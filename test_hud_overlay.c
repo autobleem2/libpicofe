@@ -69,15 +69,21 @@ static Uint32 read_pixel(int x, int y)
 	return px & 0xffffff;
 }
 
-int main(void)
+/* int argc, char *argv[] even though neither is used: SDL2's pkg-config passes -Dmain=SDL_main, so this
+ * literally becomes SDL_main() - which SDL_main.h declares with that signature, not (void). */
+int main(int argc, char *argv[])
 {
+	(void)argc;
+	(void)argv;
 	const int W = 64, H = 64;
 	SDL_Rect dst = { 0, 0, W, H };
 	unsigned short frame[8 * 8];
 	int i;
 
-	setenv("SDL_VIDEODRIVER", "dummy", 1);
-	setenv("SDL_RENDER_DRIVER", "software", 1);
+	/* SDL_setenv, not POSIX setenv: MinGW (the Windows build) has no setenv, and SDL_setenv has
+	 * been in SDL since 2.0.0 - see frontend/plat_sdl2.c's use of it in the pcsx-abnxt repo. */
+	SDL_setenv("SDL_VIDEODRIVER", "dummy", 1);
+	SDL_setenv("SDL_RENDER_DRIVER", "software", 1);
 
 	if (plat_sdl2_init("test_hud_overlay", W, H, 0, 0) != 0) {
 		fprintf(stderr, "plat_sdl2_init failed - cannot run this test here\n");
