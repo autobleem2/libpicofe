@@ -133,6 +133,7 @@ static SDL_GLContext context;
 static int is_gles;               /* the context is GLES (else desktop GL 2.1): the shaders' #version */
 static int windowed_w, windowed_h;
 static int fullscreen;
+static int mode_w, mode_h;        /* the output mode asked for (plat_ab_set_output_mode), 0 = the desktop's */
 static SDL_atomic_t frame_count;  /* presents so far; shot_want/shot_serial: a debug driver's readback */
 static SDL_atomic_t shot_want, shot_serial;
 static int frame_cache_on;
@@ -546,14 +547,15 @@ int plat_ab_set_fullscreen(int on)
   on = !!on;
   if (on == fullscreen)
     return 0;
-  ret = SDL_SetWindowFullscreen(plat_ab_window, on ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+  ret = SDL_SetWindowFullscreen(plat_ab_window,
+    !on ? 0 : mode_w > 0 ? SDL_WINDOW_FULLSCREEN : SDL_WINDOW_FULLSCREEN_DESKTOP);
   if (ret != 0) {
     fprintf(stderr, "plat_ab: SDL_SetWindowFullscreen failed: %s\n", SDL_GetError());
     return -1;
   }
   fullscreen = on;
   if (!on)
-    SDL_SetWindowSize(plat_ab_window, windowed_w, windowed_h);
+    SDL_SetWindowSize(plat_ab_window, mode_w > 0 ? mode_w : windowed_w, mode_w > 0 ? mode_h : windowed_h);
   plat_ab_show_cursor(!on);
   update_output_size();
   if (plat_ab_resize_cb != NULL)
@@ -564,6 +566,62 @@ int plat_ab_set_fullscreen(int on)
 int plat_ab_is_fullscreen(void)
 {
   return fullscreen;
+}
+
+int plat_ab_has_mode(int w, int h)
+{
+  SDL_DisplayMode m;
+  int di, n, i;
+
+  if (plat_ab_window == NULL || (di = SDL_GetWindowDisplayIndex(plat_ab_window)) < 0)
+    return 0;
+  n = SDL_GetNumDisplayModes(di);
+  for (i = 0; i < n; i++)
+    if (SDL_GetDisplayMode(di, i, &m) == 0 && m.w == w && m.h == h)
+      return 1;
+  return 0;
+}
+
+int plat_ab_set_output_mode(int w, int h)
+{
+  SDL_DisplayMode want, got;
+  int di, ret = 0;
+
+  if (plat_ab_window == NULL)
+    return -1;
+  if (w == mode_w && h == mode_h)
+    return 0;
+  if (w > 0) {
+    di = SDL_GetWindowDisplayIndex(plat_ab_window);
+    memset(&want, 0, sizeof(want));
+    want.w = w;
+    want.h = h;
+    if (di < 0 || SDL_GetClosestDisplayMode(di, &want, &got) == NULL || got.w != w || got.h != h) {
+      fprintf(stderr, "plat_ab: the display has no %dx%d mode\n", w, h);
+      return -1;
+    }
+    if (fullscreen) {
+      /* the mode is applied when the window goes (or is made again) exclusive fullscreen */
+      ret = SDL_SetWindowDisplayMode(plat_ab_window, &got);
+      if (ret == 0)
+        ret = SDL_SetWindowFullscreen(plat_ab_window, 0) | SDL_SetWindowFullscreen(plat_ab_window, SDL_WINDOW_FULLSCREEN);
+    } else {
+      SDL_SetWindowSize(plat_ab_window, w, h);
+    }
+  } else if (fullscreen) {
+    ret = SDL_SetWindowFullscreen(plat_ab_window, SDL_WINDOW_FULLSCREEN_DESKTOP);
+  } else {
+    SDL_SetWindowSize(plat_ab_window, windowed_w, windowed_h);
+  }
+  if (ret != 0)
+    fprintf(stderr, "plat_ab: output mode %dx%d: %s\n", w, h, SDL_GetError());
+  mode_w = w;
+  mode_h = h;
+  update_output_size();
+  printf("plat_ab: output mode %s, output %dx%d\n", w > 0 ? "set" : "the desktop's", plat_ab_win_w, plat_ab_win_h);
+  if (plat_ab_resize_cb != NULL)
+    plat_ab_resize_cb(plat_ab_win_w, plat_ab_win_h);
+  return ret != 0 ? -1 : 0;
 }
 
 void plat_ab_set_title(const char *title)

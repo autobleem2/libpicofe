@@ -26,6 +26,11 @@ int  plat_ab_init(const char *title, int w, int h, int fullscreen, int vsync);
 void plat_ab_finish(void);
 int  plat_ab_set_fullscreen(int on);
 int  plat_ab_is_fullscreen(void);
+/* the output mode: 1 when the display lists a w x h mode; plat_ab_set_output_mode(w, h) switches to it in
+ * fullscreen (0, 0 = the display's own mode, the desktop's), sizes the window when windowed, and calls
+ * plat_ab_resize_cb. -1 when the display has no such mode (nothing changed). */
+int  plat_ab_has_mode(int w, int h);
+int  plat_ab_set_output_mode(int w, int h);
 void plat_ab_set_title(const char *title);
 
 /* A shader pass, in libretro's single-file GLSL shape: the source is compiled twice, once with VERTEX and
