@@ -41,6 +41,10 @@ static int menu_key_state = 0;
 static int menu_last_used_dev = 0;
 static int menu_key_prev = 0;
 static int menu_key_repeat = 0;
+/* the application's "the run is ending" (a quit or a signal while a menu waits for a key), or NULL */
+static int (*menu_quit_check)(void);
+/* the application's ear for emulator-action keys pressed in a menu (their EMU binds), or NULL */
+static void (*menu_emu_key)(int acts);
 
 #define DRV(id) in_drivers[id]
 
@@ -387,6 +391,9 @@ static int in_update_kc_async(int *dev_id_out, int *is_down_out, int timeout_ms)
 
 		if (timeout_ms >= 0 && (int)(plat_get_ticks_ms() - ticks) > timeout_ms)
 			break;
+		/* a menu's wait for a key ends when the run does (in_menu_wait answers Back then) */
+		if (menu_quit_check != NULL && menu_quit_check())
+			break;
 
 		plat_sleep_ms(10);
 	}
@@ -474,6 +481,13 @@ finish:
 		else
 			menu_key_state &= ~result_menu;
 	}
+	/* a key the game binds to an emulator action (a console's Reset button), pressed while a menu waits */
+	if (menu_emu_key != NULL && is_down && in_devices[dev_id].binds != NULL
+	    && result < in_devices[dev_id].key_count) {
+		int acts = in_devices[dev_id].binds[IN_BIND_OFFS(result, IN_BINDTYPE_EMU)];
+		if (acts != 0)
+			menu_emu_key(acts);
+	}
 
 	if (dev_id_out != NULL)
 		*dev_id_out = dev_id;
@@ -514,6 +528,10 @@ int in_menu_wait(int interesting, char *charcode, int autorep_delay_ms)
 	/* wait until either key repeat or a new key has been pressed */
 	interesting |= PBTN_RDRAW;
 	do {
+		/* the run is ending: Back, so every menu loop unwinds the way a Back press leaves it (the
+		 * key state is not touched - nothing waits for this Back to be released) */
+		if (menu_quit_check != NULL && menu_quit_check())
+			return PBTN_MBACK;
 		ret = in_menu_wait_any(charcode, wait);
 		if (ret == 0 || ret != menu_key_prev)
 			menu_key_repeat = 0;
@@ -526,6 +544,21 @@ int in_menu_wait(int interesting, char *charcode, int autorep_delay_ms)
 	if (ret & (PBTN_UP|PBTN_DOWN))  ret &= ~(PBTN_LEFT|PBTN_RIGHT);
 
 	return ret;
+}
+
+void in_set_menu_quit_check(int (*check)(void))
+{
+	menu_quit_check = check;
+}
+
+void in_set_menu_emu_key(void (*cb)(int acts))
+{
+	menu_emu_key = cb;
+}
+
+int in_menu_keys_held(void)
+{
+	return menu_key_state;
 }
 
 const int *in_get_dev_binds(int dev_id)
