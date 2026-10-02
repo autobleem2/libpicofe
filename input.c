@@ -43,6 +43,8 @@ static int menu_key_prev = 0;
 static int menu_key_repeat = 0;
 /* the application's "the run is ending" (a quit or a signal while a menu waits for a key), or NULL */
 static int (*menu_quit_check)(void);
+/* the application's ear for emulator-action keys pressed in a menu (their EMU binds), or NULL */
+static void (*menu_emu_key)(int acts);
 
 #define DRV(id) in_drivers[id]
 
@@ -479,6 +481,13 @@ finish:
 		else
 			menu_key_state &= ~result_menu;
 	}
+	/* a key the game binds to an emulator action (a console's Reset button), pressed while a menu waits */
+	if (menu_emu_key != NULL && is_down && in_devices[dev_id].binds != NULL
+	    && result < in_devices[dev_id].key_count) {
+		int acts = in_devices[dev_id].binds[IN_BIND_OFFS(result, IN_BINDTYPE_EMU)];
+		if (acts != 0)
+			menu_emu_key(acts);
+	}
 
 	if (dev_id_out != NULL)
 		*dev_id_out = dev_id;
@@ -540,6 +549,11 @@ int in_menu_wait(int interesting, char *charcode, int autorep_delay_ms)
 void in_set_menu_quit_check(int (*check)(void))
 {
 	menu_quit_check = check;
+}
+
+void in_set_menu_emu_key(void (*cb)(int acts))
+{
+	menu_emu_key = cb;
 }
 
 const int *in_get_dev_binds(int dev_id)

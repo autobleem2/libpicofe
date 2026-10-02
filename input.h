@@ -146,6 +146,8 @@ int  in_menu_wait_any(char *charcode, int timeout_ms);
 int  in_menu_wait(int interesting, char *charcode, int autorep_delay_ms);
 /* check() != 0: the run is ending - a menu's wait for a key stops and in_menu_wait() answers PBTN_MBACK */
 void in_set_menu_quit_check(int (*check)(void));
+/* cb(acts): a key with IN_BINDTYPE_EMU binds (acts, a mask of 1 << action) went down while a menu read keys */
+void in_set_menu_emu_key(void (*cb)(int acts));
 int  in_config_parse_dev(const char *dev_name);
 int  in_config_bind_key(int dev_id, const char *key, int binds, int bind_type);
 int  in_config_bind_kbd_key(int dev_id, const char *key, int kbd_key);
