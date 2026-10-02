@@ -556,6 +556,11 @@ void in_set_menu_emu_key(void (*cb)(int acts))
 	menu_emu_key = cb;
 }
 
+int in_menu_keys_held(void)
+{
+	return menu_key_state;
+}
+
 const int *in_get_dev_binds(int dev_id)
 {
 	in_dev_t *dev = get_dev(dev_id);
