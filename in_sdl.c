@@ -10,6 +10,7 @@
  */
 
 #include <stdio.h>
+#include <assert.h>
 #include <SDL.h>
 #include "input.h"
 #include "in_sdl.h"
@@ -29,17 +30,23 @@ struct in_sdl_state {
 	int joy_id;
 	int joy_numaxes;
 	int joy_numbuttons;
-	int *joy_axis_keydown;
 	int joy_hat_down;
+	int *joy_axis_keydown;
+	SDL_Event *joy_events;
+	unsigned int joy_event_count;
+	unsigned int joy_event_alloc;
 	unsigned int joy_axis_as_btn; // bitmask; vs axes of centered sticks
 	unsigned int redraw:1;
 	unsigned int abs_to_udlr:1;
-	unsigned int hat_warned:1;
 	SDL_Event revent;
 	SDL_Event mevent; // last mouse event
 	keybits_t keystate[SDLK_LAST / KEYBITS_WORD_BITS + 1];
 	// emulator keys should always be processed immediately lest one is lost
 	keybits_t emu_keys[SDLK_LAST / KEYBITS_WORD_BITS + 1];
+	// "parent" state tracks all joy states to write to their joy_events
+	unsigned int joy_states_count;
+	struct in_sdl_state *parent;
+	struct in_sdl_state *joy_states[0];
 };
 
 static void (*ext_event_handler)(void *event);
@@ -187,11 +194,11 @@ static const char * const in_sdl_keys[SDLK_LAST] = {
 	[SDLK_COMPOSE] = "compose",
 };
 
-static struct in_sdl_state *state_alloc(int joy_numaxes)
+static struct in_sdl_state *state_alloc(int joy_numaxes, int joy_state_count)
 {
 	struct in_sdl_state *state;
 
-	state = calloc(1, sizeof(*state));
+	state = calloc(1, sizeof(*state) + sizeof(state->joy_states[0]) * joy_state_count);
 	if (state == NULL) {
 		fprintf(stderr, "in_sdl: OOM\n");
 		return NULL;
@@ -207,6 +214,7 @@ static struct in_sdl_state *state_alloc(int joy_numaxes)
 		}
 		memset(state->joy_axis_keydown, 0xff, joy_numaxes * sizeof(state->joy_axis_keydown[0]));
 	}
+	state->joy_states_count = joy_state_count;
 	return state;
 }
 
@@ -222,7 +230,11 @@ static void in_sdl_probe(const in_drv_t *drv)
 	if (pdata->key_names)
 		key_names = pdata->key_names;
 
-	if (!(state = state_alloc(0)))
+	/* joysticks go here too */
+	SDL_InitSubSystem(SDL_INIT_JOYSTICK);
+	joycount = SDL_NumJoysticks();
+
+	if (!(state = state_alloc(0, joycount)))
 		return;
 
 	state->drv = drv;
@@ -230,32 +242,31 @@ static void in_sdl_probe(const in_drv_t *drv)
 		key_names, 0);
 	//SDL_EnableUNICODE(1);
 
-	/* joysticks go here too */
-	SDL_InitSubSystem(SDL_INIT_JOYSTICK);
-
-	joycount = SDL_NumJoysticks();
 	for (i = 0; i < joycount; i++) {
+		struct in_sdl_state *jstate;
 		joy = SDL_JoystickOpen(i);
 		if (joy == NULL)
 			continue;
 
-		if (!(state = state_alloc(SDL_JoystickNumAxes(joy))))
+		if (!(jstate = state_alloc(SDL_JoystickNumAxes(joy), 0)))
 			break;
-		state->joy = joy;
-		state->joy_id = i;
-		state->joy_numbuttons = SDL_JoystickNumButtons(joy);
-		state->drv = drv;
-		for (a = 0; a < state->joy_numaxes; a++)
+		jstate->joy = joy;
+		jstate->joy_id = i;
+		jstate->joy_numbuttons = SDL_JoystickNumButtons(joy);
+		jstate->drv = drv;
+		jstate->parent = state;
+		state->joy_states[i] = jstate;
+		for (a = 0; a < jstate->joy_numaxes; a++)
 			if (SDL_JoystickGetAxis(joy, a) < -16384)
-				state->joy_axis_as_btn |= 1u << a;
+				jstate->joy_axis_as_btn |= 1u << a;
 
 		snprintf(name, sizeof(name), IN_SDL_PREFIX "%s", SDL_JoystickName(i));
-		in_register(name, -1, state, SDLK_LAST, key_names, 0);
+		in_register(name, -1, jstate, SDLK_LAST, key_names, 0);
 
 		printf("  %s: %d buttons %d axes %d hat(s), "
 			"guessed axis_as_btn mask: %x\n",
-			name, state->joy_numbuttons, state->joy_numaxes,
-			SDL_JoystickNumHats(joy), state->joy_axis_as_btn);
+			name, jstate->joy_numbuttons, jstate->joy_numaxes,
+			SDL_JoystickNumHats(joy), jstate->joy_axis_as_btn);
 	}
 
 	if (joycount > 0)
@@ -265,11 +276,24 @@ static void in_sdl_probe(const in_drv_t *drv)
 static void in_sdl_free(void *drv_data)
 {
 	struct in_sdl_state *state = drv_data;
+	unsigned int i;
 
 	if (state != NULL) {
 		if (state->joy != NULL)
 			SDL_JoystickClose(state->joy);
 		free(state->joy_axis_keydown);
+		free(state->joy_events);
+		if (state->parent) {
+			for (i = 0; i < state->parent->joy_states_count; i++) {
+				if (state->parent->joy_states[i] == state) {
+					state->parent->joy_states[i] = NULL;
+					break;
+				}
+			}
+		}
+		for (i = 0; i < state->joy_states_count; i++)
+			if (state->joy_states[i])
+				state->joy_states[i]->parent = NULL;
 		free(state);
 	}
 }
@@ -309,13 +333,67 @@ static int get_keystate(keybits_t *keystate, int sym)
 	return !!(*ks_word & mask);
 }
 
-static int handle_event(struct in_sdl_state *state, SDL_Event *event,
+static int handle_input_event(struct in_sdl_state *state, const SDL_Event *event,
 	int *kc_out, int *down_out, int *emu_out)
 {
-	int emu;
+	int emu, joy_id = -1;
+	short xrel, yrel;
+	Uint8 bmask;
 
-	if (event->type != SDL_KEYDOWN && event->type != SDL_KEYUP)
+	switch (event->type) {
+	case SDL_KEYDOWN:
+	case SDL_KEYUP:
+		break;
+	case SDL_MOUSEBUTTONDOWN:
+	case SDL_MOUSEBUTTONUP:
+		bmask = SDL_BUTTON(event->button.button);
+		if (event->button.state == SDL_PRESSED)
+			state->mevent.motion.state |= bmask;
+		else	state->mevent.motion.state &= ~bmask;
+		return 0;
+	case SDL_MOUSEMOTION:
+		xrel = state->mevent.motion.xrel;
+		yrel = state->mevent.motion.yrel;
+		state->mevent = *event;
+		state->mevent.motion.xrel += xrel;
+		state->mevent.motion.yrel += yrel;
+		return 0;
+	case SDL_JOYAXISMOTION:
+		joy_id = event->jaxis.which;
+		break;
+	case SDL_JOYBUTTONDOWN:
+	case SDL_JOYBUTTONUP:
+		joy_id = event->jbutton.which;
+		break;
+	case SDL_JOYHATMOTION:
+		joy_id = event->jhat.which;
+		break;
+	default:
 		return -1;
+	}
+
+	if (joy_id >= 0) {
+		// send to the joy queue
+		struct in_sdl_state *jstate;
+		if ((unsigned int)joy_id >= state->joy_states_count ||
+		    state->joy_states[joy_id] == NULL) {
+			assert(0);
+			return -1;
+		}
+		jstate = state->joy_states[joy_id];
+		if (jstate->joy_event_count >= jstate->joy_event_alloc) {
+			int cnt = jstate->joy_event_count + 16;
+			void *tmp = realloc(jstate->joy_events, sizeof(jstate->joy_events[0]) * cnt);
+			if (tmp == NULL) {
+				assert(0);
+				return -1;
+			}
+			jstate->joy_events = tmp;
+			jstate->joy_event_alloc = cnt;
+		}
+		jstate->joy_events[jstate->joy_event_count++] = *event;
+		return 0;
+	}
 
 	emu = get_keystate(state->emu_keys, event->key.keysym.sym);
 	update_keystate(state->keystate, event->key.keysym.sym,
@@ -343,8 +421,7 @@ static int handle_joy_event(struct in_sdl_state *state, SDL_Event *event,
 	case SDL_JOYAXISMOTION:
 		if ((unsigned)event->jaxis.axis >= (unsigned)state->joy_numaxes)
 			return 1;
-		if (event->jaxis.which != state->joy_id)
-			return -2;
+		assert(event->jaxis.which == state->joy_id);
 		if (event->jaxis.value < -16384) {
 			if (state->abs_to_udlr && event->jaxis.axis < 2)
 				kc = event->jaxis.axis ? SDLK_UP : SDLK_LEFT;
@@ -379,17 +456,15 @@ static int handle_joy_event(struct in_sdl_state *state, SDL_Event *event,
 
 	case SDL_JOYBUTTONDOWN:
 	case SDL_JOYBUTTONUP:
-		if (event->jbutton.which != state->joy_id)
-			return -2;
+		assert(event->jbutton.which == state->joy_id);
 		kc = kc_button_base + (int)event->jbutton.button;
 		down = event->jbutton.state == SDL_PRESSED;
 		ret = 1;
 		break;
 	case SDL_JOYHATMOTION:
-		if (event->jhat.which != state->joy_id)
-			return -2;
-		xor = event->jhat.value ^ state->joy_hat_down;
-		val = state->joy_hat_down = event->jhat.value;
+		assert(event->jhat.which == state->joy_id);
+		val = event->jhat.value;
+		xor = val ^ state->joy_hat_down;
 		for (i = 0; i < 4; i++, xor >>= 1, val >>= 1) {
 			if (xor & 1) {
 				if (event->jhat.hat)
@@ -397,15 +472,14 @@ static int handle_joy_event(struct in_sdl_state *state, SDL_Event *event,
 				else
 					kc = hat2uldr[i];
 				down = val & 1;
+				state->joy_hat_down &= ~(1u << i);
+				state->joy_hat_down |= down << i;
 				ret = 1;
 				break;
 			}
 		}
-		if ((!ret || (xor >> ret)) && !state->hat_warned) {
-			// none, more than 1, or upper bits changed
-			fprintf(stderr, "in_sdl: unexpected hat behavior\n");
-			state->hat_warned = 1;
-		}
+		if ((state->joy_hat_down ^ event->jhat.value) & 0x0f)
+			ret = 2; // repeat this event
 		break;
 	default:
 		//printf("joy ev %d\n", event->type);
@@ -426,13 +500,9 @@ static int handle_joy_event(struct in_sdl_state *state, SDL_Event *event,
 	return ret;
 }
 
-#define JOY_EVENTS (SDL_JOYAXISMOTIONMASK | SDL_JOYBALLMOTIONMASK | SDL_JOYHATMOTIONMASK \
-		    | SDL_JOYBUTTONDOWNMASK | SDL_JOYBUTTONUPMASK)
-
 static int collect_events(struct in_sdl_state *state, int *one_kc, int *one_down)
 {
 	SDL_Event events[8];
-	Uint32 mask = state->joy ? JOY_EVENTS : (SDL_ALLEVENTS & ~JOY_EVENTS);
 	int count, maxcount, is_emukey = 0;
 	int i = 0, ret = 0, retval = 0;
 	SDL_Event *event;
@@ -440,46 +510,21 @@ static int collect_events(struct in_sdl_state *state, int *one_kc, int *one_down
 	SDL_PumpEvents();
 
 	maxcount = ARRAY_SIZE(events);
-	if ((count = SDL_PeepEvents(events, maxcount, SDL_GETEVENT, mask)) > 0) {
-		for (i = 0; i < count; i++) {
-			event = &events[i];
-			if (state->joy) {
-				ret = handle_joy_event(state,
-					event, one_kc, one_down, &is_emukey);
-			} else {
-				ret = handle_event(state,
-					event, one_kc, one_down, &is_emukey);
-			}
-			if (ret < 0) {
-				switch (ret) {
-					case -2:
-						SDL_PushEvent(event);
-						break;
-					default:
-						if (event->type == SDL_VIDEORESIZE) {
-							state->redraw = 1;
-							state->revent = *event;
-						} else if (event->type == SDL_VIDEOEXPOSE) {
-							if (state->revent.type == SDL_NOEVENT) {
-								state->redraw = 1;
-								state->revent.type = SDL_VIDEOEXPOSE;
-							}
-						} else
-						if ((event->type == SDL_MOUSEBUTTONDOWN) ||
-						    (event->type == SDL_MOUSEBUTTONUP)) {
-							int mask = SDL_BUTTON(event->button.button);
-							if (event->button.state == SDL_PRESSED)
-								state->mevent.motion.state |= mask;
-							else	state->mevent.motion.state &= ~mask;
-						} else if (event->type == SDL_MOUSEMOTION) {
-							event->motion.xrel += state->mevent.motion.xrel;
-							event->motion.yrel += state->mevent.motion.yrel;
-							state->mevent = *event;
-						}
-						else if (ext_event_handler != NULL)
-							ext_event_handler(event);
-						break;
-				}
+	if ((count = SDL_PeepEvents(events, maxcount, SDL_PEEKEVENT, SDL_ALLEVENTS)) > 0) {
+		for (i = 0; i < count; ) {
+			event = &events[i++];
+			ret = handle_input_event(state, event, one_kc, one_down, &is_emukey);
+			if (ret < 0) { // unhandled event
+				if (event->type == SDL_VIDEORESIZE) {
+					state->redraw = 1;
+					state->revent = *event;
+				} else if (event->type == SDL_VIDEOEXPOSE) {
+					if (state->revent.type == SDL_NOEVENT) {
+						state->redraw = 1;
+						state->revent.type = SDL_VIDEOEXPOSE;
+					}
+				} else if (ext_event_handler != NULL)
+					ext_event_handler(event);
 				continue;
 			}
 
@@ -490,6 +535,9 @@ static int collect_events(struct in_sdl_state *state, int *one_kc, int *one_down
 			}
 		}
 	}
+	// remove the handled events
+	if (i)
+		SDL_PeepEvents(events, i, SDL_GETEVENT, SDL_ALLEVENTS);
 
 	// if the event queue has been emptied and resize/expose events were in it
 	if (state->redraw && count == 0) {
@@ -505,11 +553,39 @@ static int collect_events(struct in_sdl_state *state, int *one_kc, int *one_down
 		}
 		if (one_down != NULL)
 			*one_down = 1;
-	} else
-		i++;
-	// don't lose events other devices might want to handle
-	if (i < count)
-		SDL_PeepEvents(events+i, count-i, SDL_ADDEVENT, mask);
+	}
+	return retval;
+}
+
+static int do_joy_events(struct in_sdl_state *state, int *one_kc, int *one_down)
+{
+	int is_emukey = 0, ret = 0, retval = 0;
+	SDL_Event *event;
+	unsigned int i;
+
+	for (i = 0; i < state->joy_event_count; ) {
+		event = &state->joy_events[i];
+		ret = handle_joy_event(state, event, one_kc, one_down, &is_emukey);
+		if (ret != 2) // not a repeated event
+			i++;
+		if (ret < 0) {
+			// unhandled - drop
+			continue;
+		}
+
+		retval |= ret;
+		if ((is_emukey || one_kc != NULL) && retval)
+		{
+			break;
+		}
+	}
+
+	// remove the handled events
+	if (i < state->joy_event_count)
+		memmove(&state->joy_events[0], &state->joy_events[i],
+			sizeof(state->joy_events[0]) * (state->joy_event_count - i));
+	state->joy_event_count -= i;
+
 	return retval;
 }
 
@@ -519,8 +595,13 @@ static int in_sdl_update(void *drv_data, const int *binds, int *result)
 	keybits_t mask;
 	int i, sym, bit, b;
 
-	collect_events(state, NULL, NULL);
+	if (!state->joy)
+		collect_events(state, NULL, NULL);
+	else
+		do_joy_events(state, NULL, NULL);
 
+	if (!binds)
+		return 0;
 	for (i = 0; i < SDLK_LAST / KEYBITS_WORD_BITS + 1; i++) {
 		mask = state->keystate[i];
 		if (mask == 0)
@@ -544,8 +625,13 @@ static int in_sdl_update_kbd(void *drv_data, const int *binds, int *result)
 	keybits_t mask;
 	int i, sym, bit, b = 0;
 
-	collect_events(state, NULL, NULL);
+	if (!state->joy)
+		collect_events(state, NULL, NULL);
+	else
+		do_joy_events(state, NULL, NULL);
 
+	if (!binds)
+		return 0;
 	for (i = 0; i < SDLK_LAST / KEYBITS_WORD_BITS + 1; i++) {
 		mask = state->keystate[i];
 		if (mask == 0)
@@ -616,7 +702,10 @@ static int in_sdl_update_keycode(void *drv_data, int *is_down)
 	struct in_sdl_state *state = drv_data;
 	int ret_kc = -1, ret_down = 0;
 
-	collect_events(state, &ret_kc, &ret_down);
+	if (!state->joy)
+		collect_events(state, &ret_kc, &ret_down);
+	else
+		do_joy_events(state, &ret_kc, &ret_down);
 
 	if (is_down != NULL)
 		*is_down = ret_down;

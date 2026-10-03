@@ -56,6 +56,7 @@ int g_menubg_src_h;
 int g_menubg_src_pp;
 
 int g_autostateld_opt;
+int g_alphasort_opt = 1;
 
 static unsigned char *menu_font_data = NULL;
 static int menu_text_color = 0xfffe; // default to white
@@ -955,13 +956,15 @@ static int scandir_cmp(const void *p1, const void *p2)
 	if ((p = (*d2)->d_name)[0] == '.' && p[1] == '.' && p[2] == 0)
 		return 1;
 	if ((*d1)->d_type == (*d2)->d_type)
-		return alphasort(d1, d2);
+		return g_alphasort_opt ? alphasort(d1, d2)
+				: strcasecmp((*d1)->d_name, (*d2)->d_name);
 	if ((*d1)->d_type == DT_DIR)
 		return -1;	// directories before files/links
 	if ((*d2)->d_type == DT_DIR)
 		return  1;
 
-	return alphasort(d1, d2);
+	return g_alphasort_opt  ? alphasort(d1, d2)
+				: strcasecmp((*d1)->d_name, (*d2)->d_name);
 }
 
 static const char **filter_exts_internal;

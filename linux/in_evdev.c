@@ -323,6 +323,9 @@ static int in_evdev_update(void *drv_data, const int *binds, int *result)
 	in_evdev_t *dev = drv_data;
 	int rd, ret, u, lzone;
 
+	if (!binds)
+		return 0;
+
 	if (dev->kbits == NULL) {
 		ret = ioctl(dev->fd, EVIOCGKEY(sizeof(keybits_)), keybits_);
 		if (ret == -1) {

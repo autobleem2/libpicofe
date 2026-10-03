@@ -127,7 +127,7 @@ void in_register(const char *nname, int drv_fd_hnd, void *drv_data,
 	int i, ret, dupe_count = 0, *binds, *kbd_binds;
 	char name[256], *name_end, *tmp;
 
-	strncpy(name, nname, sizeof(name));
+	strncpy(name, nname, sizeof(name)-12);
 	name[sizeof(name)-12] = 0;
 	name_end = name + strlen(name);
 
@@ -287,7 +287,7 @@ void in_probe(void)
 	}
 
 	/* get rid of devs without binds and probes */
-	for (i = 0; i < in_dev_count; i++) {
+	for (i = 0; i < in_dev_count && in_dev_count < IN_MAX_DEVS; i++) {
 		if (!in_devices[i].probed && in_devices[i].binds == NULL) {
 			in_dev_count--;
 			if (i < in_dev_count) {
@@ -316,7 +316,7 @@ int in_update(int *result)
 
 	for (i = 0; i < in_dev_count; i++) {
 		in_dev_t *dev = &in_devices[i];
-		if (dev->probed && dev->binds != NULL)
+		if (dev->probed)
 			ret |= DRV(dev->drv_id).update(dev->drv_data, dev->binds, result);
 	}
 
@@ -329,7 +329,7 @@ int in_update_kbd(int *result)
 
 	for (i = 0; i < in_dev_count; i++) {
 		in_dev_t *dev = &in_devices[i];
-		if (dev->probed && dev->binds != NULL)
+		if (dev->probed)
 			ret += DRV(dev->drv_id).update_kbd(dev->drv_data, dev->kbd_binds, result+ret);
 	}
 
@@ -1095,6 +1095,7 @@ static void in_def_free(void *drv_data) {}
 static int  in_def_clean_binds(void *drv_data, int *b, int *db) { return 1; }
 static int  in_def_get_config(void *drv_data, enum in_cfg_opt what, int *val) { return -1; }
 static int  in_def_set_config(void *drv_data, enum in_cfg_opt what, int val) { return -1; }
+static int  in_def_update_kbd(void *drv_data, const int *binds, int *result) { return 0; }
 static int  in_def_update_analog(void *drv_data, int axis_id, int *result) { return -1; }
 static int  in_def_update_pointer(void *drv_data, int id, int *result) { return -1; }
 static int  in_def_update_keycode(void *drv_data, int *is_down) { return 0; }
@@ -1126,6 +1127,7 @@ int in_register_driver(const in_drv_t *drv,
 	CHECK_ADD_STUB(new_drivers[in_driver_count], clean_binds);
 	CHECK_ADD_STUB(new_drivers[in_driver_count], get_config);
 	CHECK_ADD_STUB(new_drivers[in_driver_count], set_config);
+	CHECK_ADD_STUB(new_drivers[in_driver_count], update_kbd);
 	CHECK_ADD_STUB(new_drivers[in_driver_count], update_analog);
 	CHECK_ADD_STUB(new_drivers[in_driver_count], update_pointer);
 	CHECK_ADD_STUB(new_drivers[in_driver_count], update_keycode);

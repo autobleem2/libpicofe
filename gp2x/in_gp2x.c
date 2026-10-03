@@ -133,6 +133,9 @@ static int in_gp2x_update(void *drv_data, const int *binds, int *result)
 	int type_start = 0;
 	int i, t, keys;
 
+	if (!binds)
+		return 0;
+
 	keys = in_gp2x_get_bits();
 
 	if (keys & in_gp2x_combo_keys) {

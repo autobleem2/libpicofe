@@ -127,6 +127,7 @@ extern int g_menubg_src_h;
 extern int g_menubg_src_pp;
 
 extern int g_autostateld_opt;
+extern int g_alphasort_opt;
 
 extern int me_mfont_w, me_mfont_h;
 extern int me_sfont_w, me_sfont_h;
