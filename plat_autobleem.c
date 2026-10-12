@@ -114,6 +114,7 @@ typedef char GLchar;
   X(void, TexSubImage2D, (GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void *)) \
   X(void, Uniform1i, (GLint, GLint)) \
   X(void, Uniform2f, (GLint, GLfloat, GLfloat)) \
+  X(void, Uniform4f, (GLint, GLfloat, GLfloat, GLfloat, GLfloat)) \
   X(void, UniformMatrix4fv, (GLint, GLsizei, GLboolean, const GLfloat *)) \
   X(void, UseProgram, (GLuint)) \
   X(void, VertexAttrib4f, (GLuint, GLfloat, GLfloat, GLfloat, GLfloat)) \
@@ -151,6 +152,13 @@ static int smooth_w, smooth_h, smooth_ok;
 static GLuint scan_tex;
 static int scan_dark, scan_bright, scan_alpha;
 static int scan_tex_h, scan_tex_dark, scan_tex_bright, scan_tex_alpha;
+/* the screen halo: the picture after the filter pass, dst's size, 8888 (a CRT shader's gradients), and the
+ * glow - that picture averaged down to 1/HALO_SHRINK, which the bands spread further */
+#define HALO_SHRINK 16
+static int halo_on;
+static GLuint halo_fbo, halo_tex, glow_fbo, glow_tex;
+static int halo_w, halo_h, halo_ok, glow_w, glow_h, glow_ok;
+static GLint halo_rect_loc;
 /* the HUD's slots */
 static struct {
   GLuint tex;
@@ -168,7 +176,10 @@ typedef struct {
 #define MAX_PROGRAMS 24
 static Program programs[MAX_PROGRAMS];
 static Program blit;                    /* the plain copy: the menu, the scanlines, the HUD, a missing filter */
+static Program halo;                    /* the halo's bands (halo_src) */
+static Program glow;                    /* the picture averaged down for them (glow_src) */
 static const struct plat_ab_shader *pipe_smooth, *pipe_filter;
+static int filter_pic_w, filter_pic_h;  /* plat_ab_set_filter_picture, 0 = the input's own size */
 static unsigned int pass_frame;
 
 /* our own copy pass: one read per pixel, the input texture's filter decides nearest or bilinear */
@@ -186,6 +197,64 @@ static const char blit_src[] =
   "varying vec2 uv;\n"
   "uniform sampler2D Texture;\n"
   "void main() { gl_FragColor = texture2D(Texture, uv); }\n"
+  "#endif\n";
+
+/* the glow: each pixel the average of the HALO_SHRINK x HALO_SHRINK block of the picture it stands for - 16
+ * bilinear reads, each already the mean of 2x2 - so a small detail does not flicker in and out of it */
+static const char glow_src[] =
+  "#if defined(VERTEX)\n"
+  "attribute vec4 VertexCoord;\n"
+  "attribute vec4 TexCoord;\n"
+  "varying vec2 uv;\n"
+  "uniform mat4 MVPMatrix;\n"
+  "void main() { gl_Position = MVPMatrix * VertexCoord; uv = TexCoord.xy; }\n"
+  "#elif defined(FRAGMENT)\n"
+  "#ifdef GL_ES\n"
+  "precision mediump float;\n"
+  "#endif\n"
+  "varying vec2 uv;\n"
+  "uniform sampler2D Texture;\n"
+  "uniform vec2 OutputSize;\n"
+  "void main() {\n"
+  "  vec2 st = 1.0 / (OutputSize * 4.0);\n"
+  "  vec3 sum = vec3(0.0);\n"
+  "  for (int y = 0; y < 4; y++)\n"
+  "    for (int x = 0; x < 4; x++)\n"
+  "      sum += texture2D(Texture, uv + (vec2(float(x), float(y)) - 1.5) * st).rgb;\n"
+  "  gl_FragColor = vec4(sum / 16.0, 1.0);\n"
+  "}\n"
+  "#endif\n";
+
+/* the halo's bands, from the glow: uv runs past 0..1 outside the picture and is folded back at its edges (a
+ * mirror, again and again where a band is wider than the picture), spread by four reads a glow pixel apart,
+ * 50 % bright next to the picture and fading to black at the screen's edge (Rect: the picture's place on the
+ * screen, 0..1, as VertexCoord) - a glow of the picture's colours, not a second picture */
+static const char halo_src[] =
+  "#if defined(VERTEX)\n"
+  "attribute vec4 VertexCoord;\n"
+  "attribute vec4 TexCoord;\n"
+  "varying vec2 uv;\n"
+  "varying vec2 pos;\n"
+  "uniform mat4 MVPMatrix;\n"
+  "void main() { gl_Position = MVPMatrix * VertexCoord; uv = TexCoord.xy; pos = VertexCoord.xy; }\n"
+  "#elif defined(FRAGMENT)\n"
+  "#ifdef GL_ES\n"
+  "precision mediump float;\n"
+  "#endif\n"
+  "varying vec2 uv;\n"
+  "varying vec2 pos;\n"
+  "uniform sampler2D Texture;\n"
+  "uniform vec2 TextureSize;\n"
+  "uniform vec4 Rect;\n"
+  "void main() {\n"
+  "  vec2 m = 1.0 - abs(mod(uv, 2.0) - 1.0);\n"
+  "  vec2 d = 1.0 / TextureSize;\n"
+  "  vec3 c = texture2D(Texture, m + vec2(-d.x, -d.y)).rgb + texture2D(Texture, m + vec2(d.x, -d.y)).rgb +\n"
+  "           texture2D(Texture, m + vec2(-d.x, d.y)).rgb + texture2D(Texture, m + vec2(d.x, d.y)).rgb;\n"
+  "  vec2 band = max(max(Rect.xy - pos, pos - Rect.zw) / max(max(Rect.xy, 1.0 - Rect.zw), 0.001), 0.0);\n"
+  "  float f = 1.0 - clamp(max(band.x, band.y), 0.0, 1.0);\n"
+  "  gl_FragColor = vec4(c * (0.25 * 0.5 * f * f), 1.0);\n"
+  "}\n"
   "#endif\n";
 
 /* VertexCoord is 0..1 with y = 0 at the top of what is drawn; into a texture (an FBO) the rows stay in
@@ -493,6 +562,14 @@ int plat_ab_init(const char *title, int w, int h, int fullscreen_, int vsync)
   smooth_tex = new_texture();
   gl.GenFramebuffers(1, &smooth_fbo);
   scan_tex = new_texture();
+  // the halo is left out if its passes do not compile (halo.failed, glow.failed), the game is not
+  if (build_program(&halo, halo_src, "halo") == 0)
+    halo_rect_loc = gl.GetUniformLocation(halo.prog, "Rect");
+  build_program(&glow, glow_src, "halo glow");
+  halo_tex = new_texture();
+  gl.GenFramebuffers(1, &halo_fbo);
+  glow_tex = new_texture();
+  gl.GenFramebuffers(1, &glow_fbo);
 
   plat_ab_show_cursor(!fullscreen);
   return 0;
@@ -515,6 +592,22 @@ void plat_ab_finish(void)
     if (blit.prog)
       gl.DeleteProgram(blit.prog);
     memset(&blit, 0, sizeof(blit));
+    if (halo.prog)
+      gl.DeleteProgram(halo.prog);
+    memset(&halo, 0, sizeof(halo));
+    if (glow.prog)
+      gl.DeleteProgram(glow.prog);
+    memset(&glow, 0, sizeof(glow));
+    if (halo_fbo)
+      gl.DeleteFramebuffers(1, &halo_fbo);
+    if (halo_tex)
+      gl.DeleteTextures(1, &halo_tex);
+    if (glow_fbo)
+      gl.DeleteFramebuffers(1, &glow_fbo);
+    if (glow_tex)
+      gl.DeleteTextures(1, &glow_tex);
+    halo_fbo = halo_tex = glow_fbo = glow_tex = 0;
+    halo_w = halo_h = glow_w = glow_h = 0;
     for (i = 0; i < PLAT_AB_HUD_SLOTS; i++) {
       if (hud[i].tex)
         gl.DeleteTextures(1, &hud[i].tex);
@@ -897,6 +990,89 @@ static int smooth_target(int kw, int kh)
   return smooth_ok;
 }
 
+void plat_ab_set_filter_picture(int w, int h)
+{
+  if (w != filter_pic_w || h != filter_pic_h)
+    fprintf(stderr, "plat_ab: the filter is told the picture is %dx%d\n", w, h);
+  filter_pic_w = w;
+  filter_pic_h = h;
+}
+
+void plat_ab_set_halo(int on)
+{
+  if (!on != !halo_on)
+    fprintf(stderr, "plat_ab: screen halo %s\n", on ? "on" : "off");
+  halo_on = on;
+}
+
+/* an 8888 render target at w x h, remade only when the size changes; 0 if the FBO cannot be made */
+static int halo_make_target(GLuint fbo, GLuint tex, int w, int h, int *cur_w, int *cur_h, int *ok,
+                            const char *name)
+{
+  if (w == *cur_w && h == *cur_h)
+    return *ok;
+  gl.BindTexture(GL_TEXTURE_2D_, tex);
+  gl.TexImage2D(GL_TEXTURE_2D_, 0, GL_RGBA_, w, h, 0, GL_RGBA_, GL_UNSIGNED_BYTE_, NULL);
+  gl.BindFramebuffer(GL_FRAMEBUFFER_, fbo);
+  gl.FramebufferTexture2D(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, GL_TEXTURE_2D_, tex, 0);
+  *ok = gl.CheckFramebufferStatus(GL_FRAMEBUFFER_) == GL_FRAMEBUFFER_COMPLETE_;
+  gl.BindFramebuffer(GL_FRAMEBUFFER_, 0);
+  *cur_w = w;
+  *cur_h = h;
+  fprintf(stderr, "plat_ab: %s %dx%d%s\n", name, w, h, *ok ? "" : " - incomplete, halo off");
+  return *ok;
+}
+
+/* the halo's two targets for a picture of w x h: the picture itself and its 1/HALO_SHRINK copy */
+static int halo_targets(int w, int h)
+{
+  int gw = w / HALO_SHRINK, gh = h / HALO_SHRINK;
+  if (gw < 4)
+    gw = 4;
+  if (gh < 4)
+    gh = 4;
+  return halo_make_target(halo_fbo, halo_tex, w, h, &halo_w, &halo_h, &halo_ok, "halo target") &&
+    halo_make_target(glow_fbo, glow_tex, gw, gh, &glow_w, &glow_h, &glow_ok, "halo glow");
+}
+
+/* one band of the halo, screen pixels x0,y0 .. x1,y1 (the viewport is the screen): its texture coordinates
+ * are where it lies against dst, so they run past 0..1 and the shader folds them back */
+static void draw_halo_band(const SDL_Rect *dst, int x0, int y0, int x1, int y1)
+{
+  int sw = plat_ab_win_w, sh = plat_ab_win_h;
+  GLfloat vc[16], tc[16], u0, v0, u1, v1;
+
+  if (x1 <= x0 || y1 <= y0)
+    return;
+  u0 = (GLfloat)(x0 - dst->x) / dst->w;
+  u1 = (GLfloat)(x1 - dst->x) / dst->w;
+  v0 = (GLfloat)(y0 - dst->y) / dst->h;
+  v1 = (GLfloat)(y1 - dst->y) / dst->h;
+#define V4(a, i, x, y) a[i] = x, a[i + 1] = y, a[i + 2] = 0, a[i + 3] = 1
+  V4(vc, 0, (GLfloat)x0 / sw, (GLfloat)y0 / sh); V4(vc, 4, (GLfloat)x1 / sw, (GLfloat)y0 / sh);
+  V4(vc, 8, (GLfloat)x0 / sw, (GLfloat)y1 / sh); V4(vc, 12, (GLfloat)x1 / sw, (GLfloat)y1 / sh);
+  V4(tc, 0, u0, v0); V4(tc, 4, u1, v0); V4(tc, 8, u0, v1); V4(tc, 12, u1, v1);
+#undef V4
+  draw_pass(&halo, glow_tex, 1, glow_w, glow_h, x1 - x0, y1 - y0, mvp_screen, vc, tc);
+}
+
+/* the bands around dst: the full-width ones above and below, then the ones left and right between them;
+ * the picture's place on the screen (0..1) tells the shader how far into its band a pixel is */
+static void draw_halo(const SDL_Rect *dst)
+{
+  int sw = plat_ab_win_w, sh = plat_ab_win_h;
+  int top = dst->y > 0 ? dst->y : 0, bottom = dst->y + dst->h < sh ? dst->y + dst->h : sh;
+
+  gl.UseProgram(halo.prog);
+  if (halo_rect_loc >= 0)
+    gl.Uniform4f(halo_rect_loc, (GLfloat)dst->x / sw, (GLfloat)dst->y / sh, (GLfloat)(dst->x + dst->w) / sw,
+      (GLfloat)(dst->y + dst->h) / sh);
+  draw_halo_band(dst, 0, 0, sw, top);
+  draw_halo_band(dst, 0, bottom, sw, sh);
+  draw_halo_band(dst, 0, top, dst->x, bottom);
+  draw_halo_band(dst, dst->x + dst->w, top, sw, bottom);
+}
+
 int plat_ab_present(const void *rgb565, int w, int h, int pitch, const SDL_Rect *dst)
 {
   int sw = plat_ab_win_w, sh = plat_ab_win_h;
@@ -918,6 +1094,10 @@ int plat_ab_present(const void *rgb565, int w, int h, int pitch, const SDL_Rect 
     Program *filter = get_program(fsh);
     GLuint in = frame_tex;
     int in_w = w, in_h = h;
+    // the halo only where there are bands; its pass goes into its texture before the screen is touched
+    int halo_now = halo_on && !halo.failed && !glow.failed &&
+      (dst->x > 0 || dst->y > 0 || dst->x + dst->w < sw || dst->y + dst->h < sh) &&
+      halo_targets(dst->w, dst->h);
 
     if (filter == NULL) {   // a filter that does not compile: a plain bilinear copy
       filter = &blit;
@@ -933,13 +1113,36 @@ int plat_ab_present(const void *rgb565, int w, int h, int pitch, const SDL_Rect 
       in_w = smooth_w;
       in_h = smooth_h;
     }
+    // a filter that counts lines (a CRT) is told the picture's own size, not a frame made larger by the 2x
+    // enhancement or the smoothing - 480 lines on a 720p screen were a moire, not a tube's 240
+    if (filter_pic_w > 0 && filter_pic_w < in_w)
+      in_w = filter_pic_w;
+    if (filter_pic_h > 0 && filter_pic_h < in_h)
+      in_h = filter_pic_h;
+    if (halo_now) {
+      // the end of the chain - the picture as it will be on the screen - into the halo's texture
+      gl.BindFramebuffer(GL_FRAMEBUFFER_, halo_fbo);
+      gl.Viewport(0, 0, dst->w, dst->h);
+      draw_pass(filter, in, fsh != NULL ? fsh->linear : 1, in_w, in_h, dst->w, dst->h, mvp_texture, quad_full,
+        quad_full);
+      // and that, averaged down, into the glow the bands are drawn from
+      gl.BindFramebuffer(GL_FRAMEBUFFER_, glow_fbo);
+      gl.Viewport(0, 0, glow_w, glow_h);
+      draw_pass(&glow, halo_tex, 1, dst->w, dst->h, glow_w, glow_h, mvp_texture, quad_full, quad_full);
+    }
     gl.BindFramebuffer(GL_FRAMEBUFFER_, 0);
     gl.Viewport(0, 0, sw, sh);
     gl.ClearColor(0, 0, 0, 1);
     gl.Clear(GL_COLOR_BUFFER_BIT_);
-    gl.Viewport(dst->x, sh - dst->y - dst->h, dst->w, dst->h);
-    draw_pass(filter, in, fsh != NULL ? fsh->linear : 1, in_w, in_h, dst->w, dst->h, mvp_screen, quad_full,
-      quad_full);
+    if (halo_now) {
+      draw_halo(dst);
+      gl.Viewport(dst->x, sh - dst->y - dst->h, dst->w, dst->h);
+      draw_pass(&blit, halo_tex, 0, dst->w, dst->h, dst->w, dst->h, mvp_screen, quad_full, quad_full);
+    } else {
+      gl.Viewport(dst->x, sh - dst->y - dst->h, dst->w, dst->h);
+      draw_pass(filter, in, fsh != NULL ? fsh->linear : 1, in_w, in_h, dst->w, dst->h, mvp_screen, quad_full,
+        quad_full);
+    }
 
     gl.Viewport(0, 0, sw, sh);
     gl.Enable(GL_BLEND_);

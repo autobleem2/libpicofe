@@ -47,14 +47,22 @@ struct plat_ab_shader {
 /* the passes of the next presents with a dst: smooth (NULL = none) into a texture, then filter (NULL = a
  * plain bilinear copy) into dst; a pass that does not compile is left out, with a line on stderr */
 void plat_ab_set_pipeline(const struct plat_ab_shader *smooth, const struct plat_ab_shader *filter);
+/* the size the filter pass is told its input is (TextureSize/InputSize) when the frame is larger - the
+ * picture's own size for a filter that counts lines (a CRT); 0, 0 = the input's own size */
+void plat_ab_set_filter_picture(int w, int h);
 
 /* Upload a w x h RGB565 frame (pitch in pixels) and present it. With dst: the pipeline's passes put it into
- * dst (the rest of the screen is black), then the scanlines and the HUD go over the whole screen. With
+ * dst (the rest of the screen is black, or the halo), then the scanlines and the HUD go over the whole screen. With
  * dst == NULL (the menu, a buffer the window's size): copied 1:1 over the whole window, nothing over it. */
 int  plat_ab_present(const void *rgb565, int w, int h, int pitch, const SDL_Rect *dst);
 /* scanlines over the whole screen in screen rows: dark rows, then bright rows, repeated from the top; dark
  * = 0 for none; alpha 0..255 how dark */
 void plat_ab_set_scanlines(int dark, int bright, int alpha);
+/* the screen halo: the screen outside dst (the side or top/bottom bands) filled with a glow of the picture as
+ * it is presented - after the pipeline's passes - mirrored at dst's edges, blurred, 50 % bright next to the
+ * picture and fading to black at the screen's edge; 0 = black bands. The filter pass then draws into a texture
+ * dst's size that is copied into dst and averaged down to 1/16 for the glow */
+void plat_ab_set_halo(int on);
 /* present a black frame */
 void plat_ab_clear(void);
 
