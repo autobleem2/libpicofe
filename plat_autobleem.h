@@ -43,13 +43,17 @@ struct plat_ab_shader {
   const char *src;
   int scale;   /* a smoothing pass: it draws into a texture scale x its input; the filter pass: 0 */
   int linear;  /* 1: the pass samples its input bilinearly */
-  /* optional: a second input the app draws for the pass's output size - MaskTexture (texture unit 1, nearest,
-   * repeated, RGB) and MaskSize, its size in texels. aux fills rgb (at most PLAT_AB_AUX_MAX x PLAT_AB_AUX_MAX
-   * texels, rows bottom-up as gl_FragCoord counts them) and its size, and returns 1; it is asked again only when
-   * the output's size changes. A repeated texture of any size needs GLES 3 (plat_ab_gles_version()). */
-  int (*aux)(const struct plat_ab_shader *sh, int out_w, int out_h, unsigned char *rgb, int *w, int *h);
+  /* optional: a second input the app gives the pass for its output size - AuxTexture (texture unit 1,
+   * nearest) and AuxSize, its size in texels. aux fills *a and returns 1 (0: none); it is asked again only when
+   * the output's size changes, and each pass keeps its own texture. */
+  int (*aux)(const struct plat_ab_shader *sh, int out_w, int out_h, struct plat_ab_aux *a);
 };
-#define PLAT_AB_AUX_MAX 32
+struct plat_ab_aux {
+  const unsigned char *rgba;  /* w x h RGBA8888, row 0 first (t = 0); read only during the call that set it */
+  int w, h;
+  int repeat;                 /* 1: repeated (a texture whose sides are not powers of 2 needs GLES 3 for it),
+                               * 0: clamped to its edges */
+};
 /* the context: 3 = GLES 3.x, 2 = GLES 2.0, 0 = desktop GL 2.1 (or no window yet) */
 int plat_ab_gles_version(void);
 /* the passes of the next presents with a dst: smooth (NULL = none) into a texture, then filter (NULL = a

@@ -170,10 +170,6 @@ static int frame_w, frame_h;
 /* GLES 3: the frame goes up through two pixel buffers taken in turn (AB_GL_PBO=0 turns it off) */
 static int pbo_on, pbo_next;
 static GLuint pbo[2];
-/* a pass's second input (plat_ab_shader.aux), made for the output size it was last drawn at */
-static GLuint aux_tex;
-static const struct plat_ab_shader *aux_key;
-static int aux_out_w, aux_out_h, aux_w, aux_h, aux_ok;
 /* the smoothing pass's output */
 static GLuint smooth_fbo, smooth_tex;
 static int smooth_w, smooth_h, smooth_ok;
@@ -200,7 +196,9 @@ typedef struct {
   GLuint prog;
   int failed;
   GLint mvp, texture, texture_size, input_size, output_size, frame_count, frame_direction;
-  GLint mask_texture, mask_size;      /* the aux input's, when the pass has one */
+  GLint aux_texture, aux_size;        /* the aux input's, when the pass has one */
+  GLuint aux_tex;                     /* the aux input, made for the output size it was last drawn at */
+  int aux_out_w, aux_out_h, aux_w, aux_h, aux_ok;
 } Program;
 
 #define MAX_PROGRAMS 24
@@ -388,8 +386,8 @@ static int build_program(Program *p, const char *src, const char *name)
   p->output_size = gl.GetUniformLocation(p->prog, "OutputSize");
   p->frame_count = gl.GetUniformLocation(p->prog, "FrameCount");
   p->frame_direction = gl.GetUniformLocation(p->prog, "FrameDirection");
-  p->mask_texture = gl.GetUniformLocation(p->prog, "MaskTexture");
-  p->mask_size = gl.GetUniformLocation(p->prog, "MaskSize");
+  p->aux_texture = gl.GetUniformLocation(p->prog, "AuxTexture");
+  p->aux_size = gl.GetUniformLocation(p->prog, "AuxSize");
   p->failed = 0;
   fprintf(stderr, "plat_ab: shader %s ready (%u ms)\n", name, (unsigned)(SDL_GetTicks() - t0));
   return 0;
@@ -423,17 +421,17 @@ void plat_ab_set_pipeline(const struct plat_ab_shader *smooth, const struct plat
   pipe_filter = filter;
 }
 
-static int aux_bind(const struct plat_ab_shader *sh, int out_w, int out_h);
+static int aux_bind(Program *p, int out_w, int out_h);
 
 /* one textured quad with a pass: tex sampled by `linear`, drawn into the viewport already set */
-static void draw_pass(const Program *p, GLuint tex, int linear, int in_w, int in_h, int out_w, int out_h,
+static void draw_pass(Program *p, GLuint tex, int linear, int in_w, int in_h, int out_w, int out_h,
                       const GLfloat *mvp, const GLfloat *vc, const GLfloat *tc)
 {
   gl.UseProgram(p->prog);
-  if (p->mask_texture >= 0 && p->key != NULL && p->key->aux != NULL && aux_bind(p->key, out_w, out_h)) {
-    gl.Uniform1i(p->mask_texture, 1);
-    if (p->mask_size >= 0)
-      gl.Uniform2f(p->mask_size, (GLfloat)aux_w, (GLfloat)aux_h);
+  if (p->aux_texture >= 0 && p->key != NULL && p->key->aux != NULL && aux_bind(p, out_w, out_h)) {
+    gl.Uniform1i(p->aux_texture, 1);
+    if (p->aux_size >= 0)
+      gl.Uniform2f(p->aux_size, (GLfloat)p->aux_w, (GLfloat)p->aux_h);
   }
   gl.ActiveTexture(GL_TEXTURE0_);
   gl.BindTexture(GL_TEXTURE_2D_, tex);
@@ -470,38 +468,37 @@ static GLuint new_texture(void)
   return t;
 }
 
-/* sh's second input on texture unit 1, the app's pattern for out_w x out_h - made again only when the pass or
- * the output's size changes; 0 if the app has none for it */
-static int aux_bind(const struct plat_ab_shader *sh, int out_w, int out_h)
+/* the pass's second input on texture unit 1, the app's for out_w x out_h - asked for again only when the
+ * output's size changes; 0 if the app has none for it */
+static int aux_bind(Program *p, int out_w, int out_h)
 {
-  if (sh != aux_key || out_w != aux_out_w || out_h != aux_out_h) {
-    unsigned char rgb[PLAT_AB_AUX_MAX * PLAT_AB_AUX_MAX * 3];
-    int w = 0, h = 0;
+  if (p->aux_out_w != out_w || p->aux_out_h != out_h) {
+    struct plat_ab_aux a = { NULL, 0, 0, 0 };
 
-    aux_key = sh;
-    aux_out_w = out_w;
-    aux_out_h = out_h;
-    aux_ok = sh->aux(sh, out_w, out_h, rgb, &w, &h) && w > 0 && h > 0 && w <= PLAT_AB_AUX_MAX &&
-      h <= PLAT_AB_AUX_MAX;
-    if (aux_ok) {
-      if (aux_tex == 0)
-        aux_tex = new_texture();
+    p->aux_out_w = out_w;
+    p->aux_out_h = out_h;
+    p->aux_ok = p->key->aux(p->key, out_w, out_h, &a) && a.rgba != NULL && a.w > 0 && a.h > 0;
+    if (p->aux_ok) {
       gl.ActiveTexture(GL_TEXTURE1_);
-      gl.BindTexture(GL_TEXTURE_2D_, aux_tex);
-      gl.TexImage2D(GL_TEXTURE_2D_, 0, GL_RGB_, w, h, 0, GL_RGB_, GL_UNSIGNED_BYTE_, rgb);
-      gl.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_WRAP_S_, GL_REPEAT_);
-      gl.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_WRAP_T_, GL_REPEAT_);
+      if (p->aux_tex == 0)
+        p->aux_tex = new_texture();
+      gl.BindTexture(GL_TEXTURE_2D_, p->aux_tex);
+      gl.TexImage2D(GL_TEXTURE_2D_, 0, GL_RGBA_, a.w, a.h, 0, GL_RGBA_, GL_UNSIGNED_BYTE_, a.rgba);
+      if (a.repeat) {
+        gl.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_WRAP_S_, GL_REPEAT_);
+        gl.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_WRAP_T_, GL_REPEAT_);
+      }
       gl.ActiveTexture(GL_TEXTURE0_);
-      aux_w = w;
-      aux_h = h;
+      p->aux_w = a.w;
+      p->aux_h = a.h;
     }
-    fprintf(stderr, "plat_ab: %s: its pattern for %dx%d is %dx%d%s\n", sh->name, out_w, out_h, w, h,
-      aux_ok ? "" : " - none");
+    fprintf(stderr, "plat_ab: %s: its aux input for %dx%d is %dx%d%s\n", p->key->name, out_w, out_h, a.w, a.h,
+      p->aux_ok ? (a.repeat ? ", repeated" : "") : " - none");
   }
-  if (!aux_ok)
+  if (!p->aux_ok)
     return 0;
   gl.ActiveTexture(GL_TEXTURE1_);
-  gl.BindTexture(GL_TEXTURE_2D_, aux_tex);
+  gl.BindTexture(GL_TEXTURE_2D_, p->aux_tex);
   gl.ActiveTexture(GL_TEXTURE0_);
   return 1;
 }
@@ -688,6 +685,8 @@ void plat_ab_finish(void)
     for (i = 0; i < MAX_PROGRAMS; i++) {
       if (programs[i].prog)
         gl.DeleteProgram(programs[i].prog);
+      if (programs[i].aux_tex)
+        gl.DeleteTextures(1, &programs[i].aux_tex);
       memset(&programs[i], 0, sizeof(programs[i]));
     }
     if (blit.prog)
@@ -724,11 +723,6 @@ void plat_ab_finish(void)
       gl.DeleteTextures(1, &scan_tex);
     smooth_fbo = frame_tex = smooth_tex = scan_tex = 0;
     frame_w = frame_h = smooth_w = smooth_h = scan_tex_h = 0;
-    if (aux_tex)
-      gl.DeleteTextures(1, &aux_tex);
-    aux_tex = 0;
-    aux_key = NULL;
-    aux_ok = 0;
     if (pbo_on)
       gl3.DeleteBuffers(2, pbo);
     pbo[0] = pbo[1] = 0;
