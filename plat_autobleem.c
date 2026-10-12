@@ -10,6 +10,7 @@
  * See the COPYING file in the top-level directory.
  */
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,8 @@ typedef unsigned char GLboolean;
 typedef unsigned char GLubyte;
 typedef float GLfloat;
 typedef char GLchar;
+typedef ptrdiff_t GLsizeiptr;
+typedef ptrdiff_t GLintptr;
 
 #if defined(_WIN32)
 #define GLAPI_ __stdcall
@@ -72,6 +75,14 @@ typedef char GLchar;
 #define GL_FRAMEBUFFER_COMPLETE_  0x8CD5
 #define GL_COLOR_ATTACHMENT0_     0x8CE0
 #define GL_FRAMEBUFFER_           0x8D40
+/* GLES 3 only */
+#define GL_UNPACK_ROW_LENGTH_     0x0CF2
+#define GL_REPEAT_                0x2901
+#define GL_TEXTURE1_              0x84C1
+#define GL_STREAM_DRAW_           0x88E0
+#define GL_PIXEL_UNPACK_BUFFER_   0x88EC
+#define GL_MAP_WRITE_BIT_         0x0002
+#define GL_MAP_INVALIDATE_BUFFER_BIT_ 0x0008
 
 #define GL_FUNCS(X) \
   X(void, ActiveTexture, (GLenum)) \
@@ -121,8 +132,18 @@ typedef char GLchar;
   X(void, VertexAttribPointer, (GLuint, GLint, GLenum, GLboolean, GLsizei, const void *)) \
   X(void, Viewport, (GLint, GLint, GLsizei, GLsizei))
 
+/* GLES 3's pixel buffers, loaded only with a GLES 3 context: the frame's upload through them (pbo_on) */
+#define GL3_FUNCS(X) \
+  X(void, BindBuffer, (GLenum, GLuint)) \
+  X(void, BufferData, (GLenum, GLsizeiptr, const void *, GLenum)) \
+  X(void, DeleteBuffers, (GLsizei, const GLuint *)) \
+  X(void, GenBuffers, (GLsizei, GLuint *)) \
+  X(void *, MapBufferRange, (GLenum, GLintptr, GLsizeiptr, GLbitfield)) \
+  X(GLboolean, UnmapBuffer, (GLenum))
+
 #define GL_DECL(ret, name, args) ret (GLAPI_ *name) args;
 static struct { GL_FUNCS(GL_DECL) } gl;
+static struct { GL3_FUNCS(GL_DECL) } gl3;
 #undef GL_DECL
 
 SDL_Window *plat_ab_window;
@@ -132,6 +153,7 @@ void (*plat_ab_quit_cb)(void);
 
 static SDL_GLContext context;
 static int is_gles;               /* the context is GLES (else desktop GL 2.1): the shaders' #version */
+static int gles_ver;              /* 3 = GLES 3.x, 2 = GLES 2.0, 0 = desktop GL */
 static int windowed_w, windowed_h;
 static int fullscreen;
 static int mode_w, mode_h;        /* the output mode asked for (plat_ab_set_output_mode), 0 = the desktop's */
@@ -145,6 +167,13 @@ static void (*hud_cb)(int screen_w, int screen_h);
 /* the frame, 1x as the app gives it */
 static GLuint frame_tex;
 static int frame_w, frame_h;
+/* GLES 3: the frame goes up through two pixel buffers taken in turn (AB_GL_PBO=0 turns it off) */
+static int pbo_on, pbo_next;
+static GLuint pbo[2];
+/* a pass's second input (plat_ab_shader.aux), made for the output size it was last drawn at */
+static GLuint aux_tex;
+static const struct plat_ab_shader *aux_key;
+static int aux_out_w, aux_out_h, aux_w, aux_h, aux_ok;
 /* the smoothing pass's output */
 static GLuint smooth_fbo, smooth_tex;
 static int smooth_w, smooth_h, smooth_ok;
@@ -171,6 +200,7 @@ typedef struct {
   GLuint prog;
   int failed;
   GLint mvp, texture, texture_size, input_size, output_size, frame_count, frame_direction;
+  GLint mask_texture, mask_size;      /* the aux input's, when the pass has one */
 } Program;
 
 #define MAX_PROGRAMS 24
@@ -358,6 +388,8 @@ static int build_program(Program *p, const char *src, const char *name)
   p->output_size = gl.GetUniformLocation(p->prog, "OutputSize");
   p->frame_count = gl.GetUniformLocation(p->prog, "FrameCount");
   p->frame_direction = gl.GetUniformLocation(p->prog, "FrameDirection");
+  p->mask_texture = gl.GetUniformLocation(p->prog, "MaskTexture");
+  p->mask_size = gl.GetUniformLocation(p->prog, "MaskSize");
   p->failed = 0;
   fprintf(stderr, "plat_ab: shader %s ready (%u ms)\n", name, (unsigned)(SDL_GetTicks() - t0));
   return 0;
@@ -391,11 +423,18 @@ void plat_ab_set_pipeline(const struct plat_ab_shader *smooth, const struct plat
   pipe_filter = filter;
 }
 
+static int aux_bind(const struct plat_ab_shader *sh, int out_w, int out_h);
+
 /* one textured quad with a pass: tex sampled by `linear`, drawn into the viewport already set */
 static void draw_pass(const Program *p, GLuint tex, int linear, int in_w, int in_h, int out_w, int out_h,
                       const GLfloat *mvp, const GLfloat *vc, const GLfloat *tc)
 {
   gl.UseProgram(p->prog);
+  if (p->mask_texture >= 0 && p->key != NULL && p->key->aux != NULL && aux_bind(p->key, out_w, out_h)) {
+    gl.Uniform1i(p->mask_texture, 1);
+    if (p->mask_size >= 0)
+      gl.Uniform2f(p->mask_size, (GLfloat)aux_w, (GLfloat)aux_h);
+  }
   gl.ActiveTexture(GL_TEXTURE0_);
   gl.BindTexture(GL_TEXTURE_2D_, tex);
   gl.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MIN_FILTER_, linear ? GL_LINEAR_ : GL_NEAREST_);
@@ -431,6 +470,42 @@ static GLuint new_texture(void)
   return t;
 }
 
+/* sh's second input on texture unit 1, the app's pattern for out_w x out_h - made again only when the pass or
+ * the output's size changes; 0 if the app has none for it */
+static int aux_bind(const struct plat_ab_shader *sh, int out_w, int out_h)
+{
+  if (sh != aux_key || out_w != aux_out_w || out_h != aux_out_h) {
+    unsigned char rgb[PLAT_AB_AUX_MAX * PLAT_AB_AUX_MAX * 3];
+    int w = 0, h = 0;
+
+    aux_key = sh;
+    aux_out_w = out_w;
+    aux_out_h = out_h;
+    aux_ok = sh->aux(sh, out_w, out_h, rgb, &w, &h) && w > 0 && h > 0 && w <= PLAT_AB_AUX_MAX &&
+      h <= PLAT_AB_AUX_MAX;
+    if (aux_ok) {
+      if (aux_tex == 0)
+        aux_tex = new_texture();
+      gl.ActiveTexture(GL_TEXTURE1_);
+      gl.BindTexture(GL_TEXTURE_2D_, aux_tex);
+      gl.TexImage2D(GL_TEXTURE_2D_, 0, GL_RGB_, w, h, 0, GL_RGB_, GL_UNSIGNED_BYTE_, rgb);
+      gl.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_WRAP_S_, GL_REPEAT_);
+      gl.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_WRAP_T_, GL_REPEAT_);
+      gl.ActiveTexture(GL_TEXTURE0_);
+      aux_w = w;
+      aux_h = h;
+    }
+    fprintf(stderr, "plat_ab: %s: its pattern for %dx%d is %dx%d%s\n", sh->name, out_w, out_h, w, h,
+      aux_ok ? "" : " - none");
+  }
+  if (!aux_ok)
+    return 0;
+  gl.ActiveTexture(GL_TEXTURE1_);
+  gl.BindTexture(GL_TEXTURE_2D_, aux_tex);
+  gl.ActiveTexture(GL_TEXTURE0_);
+  return 1;
+}
+
 /***************************************************************************************************
  * init
  ***************************************************************************************************/
@@ -445,9 +520,25 @@ static int load_gl(void)
   return 0;
 }
 
-/* a window with a GL context: GLES 2.0 (the console's and the Pi's, any GLES 3.x answers it), else desktop
- * GL 2.1 - the window is made again for the second try, since SDL picks EGL or the desktop's GL library
- * when the window is made */
+/* GLES 3's own calls; 0 if one is missing (the frame then goes up as on GLES 2) */
+static int load_gl3(void)
+{
+#define GL_LOAD(ret, name, args) \
+  gl3.name = (ret (GLAPI_ *) args)SDL_GL_GetProcAddress("gl" #name); \
+  if (gl3.name == NULL) { fprintf(stderr, "plat_ab: no gl" #name " - no pixel buffers\n"); return 0; }
+  GL3_FUNCS(GL_LOAD)
+#undef GL_LOAD
+  return 1;
+}
+
+int plat_ab_gles_version(void)
+{
+  return context != NULL ? gles_ver : 0;
+}
+
+/* a window with a GL context: gles 3 = GLES 3.0 (the console's PowerVR and the Pi's V3D have it), 2 = GLES 2.0,
+ * 0 = desktop GL 2.1 - tried in that order; the window is made again for each try, since SDL picks EGL or the
+ * desktop's GL library when the window is made */
 static int create_window(const char *title, int w, int h, Uint32 wflags, int gles)
 {
   SDL_GL_ResetAttributes();
@@ -458,7 +549,7 @@ static int create_window(const char *title, int w, int h, Uint32 wflags, int gle
   SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
   if (gles) {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, gles);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
   } else {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
@@ -472,12 +563,14 @@ static int create_window(const char *title, int w, int h, Uint32 wflags, int gle
   }
   context = SDL_GL_CreateContext(plat_ab_window);
   if (context == NULL) {
-    fprintf(stderr, "plat_ab: no %s context: %s\n", gles ? "GLES 2" : "GL 2.1", SDL_GetError());
+    fprintf(stderr, "plat_ab: no %s context: %s\n", gles == 3 ? "GLES 3" : gles ? "GLES 2" : "GL 2.1",
+      SDL_GetError());
     SDL_DestroyWindow(plat_ab_window);
     plat_ab_window = NULL;
     return -1;
   }
-  is_gles = gles;
+  is_gles = gles != 0;
+  gles_ver = gles;
   return 0;
 }
 
@@ -516,10 +609,18 @@ int plat_ab_init(const char *title, int w, int h, int fullscreen_, int vsync)
   else
     wflags |= SDL_WINDOW_RESIZABLE;
 
-  if (create_window(title, w, h, wflags, 1) != 0 && create_window(title, w, h, wflags, 0) != 0)
+  if (create_window(title, w, h, wflags, 3) != 0 && create_window(title, w, h, wflags, 2) != 0 &&
+      create_window(title, w, h, wflags, 0) != 0)
     goto fail;
   if (load_gl() != 0)
     goto fail;
+  if (gles_ver >= 3) {
+    const char *e = getenv("AB_GL_PBO");
+    pbo_on = (e == NULL || strcmp(e, "0") != 0) && load_gl3();
+    if (pbo_on)
+      gl3.GenBuffers(2, pbo);
+    fprintf(stderr, "plat_ab: GLES 3 - the frame goes up %s\n", pbo_on ? "through pixel buffers" : "directly");
+  }
   if (SDL_GL_SetSwapInterval(vsync ? 1 : 0) != 0)
     fprintf(stderr, "plat_ab: swap interval %d: %s\n", vsync ? 1 : 0, SDL_GetError());
   update_output_size();
@@ -623,6 +724,16 @@ void plat_ab_finish(void)
       gl.DeleteTextures(1, &scan_tex);
     smooth_fbo = frame_tex = smooth_tex = scan_tex = 0;
     frame_w = frame_h = smooth_w = smooth_h = scan_tex_h = 0;
+    if (aux_tex)
+      gl.DeleteTextures(1, &aux_tex);
+    aux_tex = 0;
+    aux_key = NULL;
+    aux_ok = 0;
+    if (pbo_on)
+      gl3.DeleteBuffers(2, pbo);
+    pbo[0] = pbo[1] = 0;
+    pbo_on = 0;
+    gles_ver = 0;
     SDL_GL_DeleteContext(context);
     context = NULL;
   }
@@ -962,6 +1073,9 @@ void plat_ab_hud_draw(int slot, const SDL_Rect *r)
 
 static void upload_frame(const void *rgb565, int w, int h, int pitch)
 {
+  const void *src = rgb565;
+  int from_pbo = 0;
+
   gl.ActiveTexture(GL_TEXTURE0_);
   gl.BindTexture(GL_TEXTURE_2D_, frame_tex);
   if (w != frame_w || h != frame_h) {
@@ -969,15 +1083,39 @@ static void upload_frame(const void *rgb565, int w, int h, int pitch)
     frame_w = w;
     frame_h = h;
   }
+  if (pbo_on && h > 0) {
+    // GLES 3: into a pixel buffer, given a fresh store each time (the GPU may still be reading the last one -
+    // no wait for it), and from there into the texture on the GPU's time; the next frame takes the other one
+    GLsizeiptr size = ((GLsizeiptr)(h - 1) * pitch + w) * 2;
+    void *p;
+    gl3.BindBuffer(GL_PIXEL_UNPACK_BUFFER_, pbo[pbo_next]);
+    pbo_next ^= 1;
+    gl3.BufferData(GL_PIXEL_UNPACK_BUFFER_, size, NULL, GL_STREAM_DRAW_);
+    p = gl3.MapBufferRange(GL_PIXEL_UNPACK_BUFFER_, 0, size, GL_MAP_WRITE_BIT_ | GL_MAP_INVALIDATE_BUFFER_BIT_);
+    if (p != NULL) {
+      memcpy(p, rgb565, (size_t)size);
+      if (gl3.UnmapBuffer(GL_PIXEL_UNPACK_BUFFER_))
+        src = NULL, from_pbo = 1;   // offset 0 in the bound buffer
+    }
+    if (!from_pbo)
+      gl3.BindBuffer(GL_PIXEL_UNPACK_BUFFER_, 0);
+  }
   if (pitch == w)
-    gl.TexSubImage2D(GL_TEXTURE_2D_, 0, 0, 0, w, h, GL_RGB_, GL_UNSIGNED_SHORT_5_6_5_, rgb565);
-  else {
+    gl.TexSubImage2D(GL_TEXTURE_2D_, 0, 0, 0, w, h, GL_RGB_, GL_UNSIGNED_SHORT_5_6_5_, src);
+  else if (gles_ver >= 3) {
+    // GLES 3 has the row length: one upload
+    gl.PixelStorei(GL_UNPACK_ROW_LENGTH_, pitch);
+    gl.TexSubImage2D(GL_TEXTURE_2D_, 0, 0, 0, w, h, GL_RGB_, GL_UNSIGNED_SHORT_5_6_5_, src);
+    gl.PixelStorei(GL_UNPACK_ROW_LENGTH_, 0);
+  } else {
     // GLES 2 has no row length: a row at a time (only a frame narrower than its buffer comes here)
     const Uint16 *p = rgb565;
     int y;
     for (y = 0; y < h; y++)
       gl.TexSubImage2D(GL_TEXTURE_2D_, 0, 0, y, w, 1, GL_RGB_, GL_UNSIGNED_SHORT_5_6_5_, p + (size_t)y * pitch);
   }
+  if (from_pbo)
+    gl3.BindBuffer(GL_PIXEL_UNPACK_BUFFER_, 0);   // every other upload (the HUD, the scanlines) reads client memory
 }
 
 /* the smoothing pass's target at kw x kh; 0 if the FBO cannot be made (smoothing is then left out) */
