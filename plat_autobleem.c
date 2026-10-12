@@ -653,6 +653,7 @@ int plat_ab_set_fullscreen(int on)
   update_output_size();
   if (plat_ab_resize_cb != NULL)
     plat_ab_resize_cb(plat_ab_win_w, plat_ab_win_h);
+  plat_ab_clear();
   return 0;
 }
 
@@ -714,6 +715,7 @@ int plat_ab_set_output_mode(int w, int h)
   printf("plat_ab: output mode %s, output %dx%d\n", w > 0 ? "set" : "the desktop's", plat_ab_win_w, plat_ab_win_h);
   if (plat_ab_resize_cb != NULL)
     plat_ab_resize_cb(plat_ab_win_w, plat_ab_win_h);
+  plat_ab_clear();
   return ret != 0 ? -1 : 0;
 }
 
@@ -722,6 +724,11 @@ void plat_ab_set_title(const char *title)
   SDL_SetWindowTitle(plat_ab_window, title);
 }
 
+/* a black frame. Also called after every change of the window's size or mode: SDL's KMSDRM driver makes the new
+ * size's EGL surface only at the next swap, and that swap throws away what was drawn into the old one - the disc
+ * splash, the first frame after the output mode was set at start, was drawn into the 1280x720 surface of the window
+ * as made, then swapped as a new, empty 1920x1080 one: the screen stayed black while the drive was read (Pi 400,
+ * 2026-10-12). Swapped here, the surface is the right one before anything is drawn. */
 void plat_ab_clear(void)
 {
   if (context == NULL)
