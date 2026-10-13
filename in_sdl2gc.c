@@ -124,8 +124,9 @@ static keybits_t get_keybits(struct in_sdl2gc_state *state)
 			SET_BIT(bits, button);
 	}
 
-	// a pad without a Guide button: Select+Start together is it (and neither on its own)
-	if (!state->has_ps && CHECK_BIT(bits, SDL2GC_BTN_SELECT) && CHECK_BIT(bits, SDL2GC_BTN_START)) {
+	// Select+Start together is the Guide button (and neither on its own) - on every pad, one with a
+	// Guide button too, so the same combo works whatever pad is in hand
+	if (CHECK_BIT(bits, SDL2GC_BTN_SELECT) && CHECK_BIT(bits, SDL2GC_BTN_START)) {
 		SET_BIT(bits, SDL2GC_BTN_PS);
 		CLEAR_BIT(bits, SDL2GC_BTN_SELECT);
 		CLEAR_BIT(bits, SDL2GC_BTN_START);
